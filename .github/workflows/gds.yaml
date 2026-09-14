@@ -14,7 +14,7 @@ jobs:
           submodules: recursive
 
       - name: Build GDS
-        uses: ofek9993/tt-gds-action@ihp-cmos5l
+        uses: TinyTapeout/tt-gds-action@ihp-cmos5l
         with:
           pdk: ihp-sg13cmos5l
 
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Run Tiny Tapeout Precheck
-        uses: ofek9993/tt-gds-action/precheck@ihp-cmos5l
+        uses: TinyTapeout/tt-gds-action/precheck@ihp-cmos5l
 
   gl_test:
     needs: gds
@@ -35,7 +35,7 @@ jobs:
           submodules: recursive
 
       - name: GL test
-        uses: ofek9993/tt-gds-action/gl_test@ihp-cmos5l
+        uses: TinyTapeout/tt-gds-action/gl_test@ihp-cmos5l
 
   viewer:
     needs: gds
@@ -44,4 +44,4 @@ jobs:
       pages: write # to deploy to Pages
       id-token: write # to verify the deployment originates from an appropriate source
     steps:
-      - uses: ofek9993/tt-gds-action/viewer@ihp-cmos5l
+      - uses: TinyTapeout/tt-gds-action/viewer@ihp-cmos5l
