@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
-  title:        "Protocol Emulator"      # Project title
+  title:        "MAC Stress Test"      # Project title
   author:       "ofek9993"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Programmable protocol emulator core for bit-banging UART, SPI and I2C"      # One line description of what your project does
+  description:  "8x8 multiply-accumulate with a 16-bit accumulator"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     10000000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -33,14 +33,14 @@ pinout:
   ui[7]: "A7"
 
   # Outputs
-  uo[0]: "SUM0"
-  uo[1]: "SUM1"
-  uo[2]: "SUM2"
-  uo[3]: "SUM3"
-  uo[4]: "SUM4"
-  uo[5]: "SUM5"
-  uo[6]: "SUM6"
-  uo[7]: "SUM7"
+  uo[0]: "ACC8"
+  uo[1]: "ACC9"
+  uo[2]: "ACC10"
+  uo[3]: "ACC11"
+  uo[4]: "ACC12"
+  uo[5]: "ACC13"
+  uo[6]: "ACC14"
+  uo[7]: "ACC15"
 
   # Bidirectional pins
   uio[0]: "B0"

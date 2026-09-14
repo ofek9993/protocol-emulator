@@ -1,27 +1,41 @@
 /*
- * Copyright (c) 2024 Your Name
+ * Copyright (c) 2026 ofek9993
  * SPDX-License-Identifier: Apache-2.0
  */
 
 `default_nettype none
 
+// Multiply-accumulate unit, used here as a workstation stress test:
+//   - an 8x8 unsigned multiplier gives deep combinational logic
+//   - a 16-bit accumulator gives real sequential state for CTS to balance
+//   - uo_out exposes the accumulator HIGH byte, so every partial product
+//     affects an observable output and nothing gets optimised away
+//
+// acc <= acc + (ui_in * uio_in)   on each rising clk, cleared by rst_n
 module tt_um_ofek9993_protoemu (
-    input  wire [7:0] ui_in,    // Dedicated inputs
-    output wire [7:0] uo_out,   // Dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: Input path
-    output wire [7:0] uio_out,  // IOs: Output path
-    output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
-    input  wire       ena,      // always 1 when the design is powered, so you can ignore it
+    input  wire [7:0] ui_in,    // Dedicated inputs  - operand A
+    output wire [7:0] uo_out,   // Dedicated outputs - accumulator [15:8]
+    input  wire [7:0] uio_in,   // IOs: Input path   - operand B
+    output wire [7:0] uio_out,  // IOs: Output path  - unused
+    output wire [7:0] uio_oe,   // IOs: Enable path  - all inputs
+    input  wire       ena,      // always 1 when the design is powered
     input  wire       clk,      // clock
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  // All output pins must be assigned. If not used, assign to 0.
-  assign uo_out  = ui_in + uio_in;  // Example: ou_out is the sum of ui_in and uio_in
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+  wire [15:0] product = ui_in * uio_in;
+  reg  [15:0] acc;
+
+  always @(posedge clk) begin
+    if (!rst_n) acc <= 16'd0;
+    else        acc <= acc + product;
+  end
+
+  assign uo_out  = acc[15:8];
+  assign uio_out = 8'h00;
+  assign uio_oe  = 8'h00;  // uio used as input (operand B)
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, clk, rst_n, 1'b0};
+  wire _unused = &{ena, 1'b0};
 
 endmodule

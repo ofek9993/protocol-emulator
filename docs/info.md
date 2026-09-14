@@ -1,36 +1,43 @@
 <!---
-
-This file is used to generate your project datasheet. Please fill in the information below and delete any unused
-sections.
-
-You can also include images in this folder and reference them in the markdown. Each image must be less than
-512 kb in size, and the combined size of all images must be less than 1 MB.
+This file is used to generate your project datasheet.
 -->
 
 ## How it works
 
-Entry for the Jane Street protocol emulator ASIC competition, targeting IHP's 130nm CMOS5L
-process via Tiny Tapeout.
+An 8x8 unsigned multiply-accumulate unit, used as a workstation stress test for
+the Jane Street protocol emulator ASIC competition flow.
 
-The goal is a small programmable core with an instruction set built for driving and sampling
-pins and counting cycles, so that serial protocols such as UART, SPI and I2C can be emulated in
-software rather than hardwired into dedicated logic. The design is inspired by the PIO state
-machines on the RP2040 and the PRU cores on TI's Sitara parts.
+On every rising clock edge the design computes `ui_in * uio_in` and adds the
+16-bit product into a 16-bit accumulator:
 
-**Current status: pipeline bring-up.** The design in this repository is still the template
-placeholder — an 8-bit adder that drives `uo_out` with `ui_in + uio_in`. It exists to validate
-the RTL-to-GDS flow end to end on this process before real design work begins.
+```
+acc <= acc + (ui_in * uio_in)
+```
+
+`uo_out` exposes the **high** byte of the accumulator (`acc[15:8]`). Reading the
+high byte rather than the low byte means every partial product in the multiplier
+array affects an observable output, so synthesis cannot optimise any of the
+multiplier away.
+
+Driving `rst_n` low clears the accumulator.
+
+This is deliberately deeper logic than a simple adder: the multiplier array gives
+several nanoseconds of combinational delay, and the 16-bit accumulator gives the
+clock tree real sequential load to balance.
 
 ## How to test
 
-Run the cocotb testbench in `test/`:
+Drive operands on `ui_in` (A) and `uio_in` (B), pulse the clock, and read the
+accumulator high byte on `uo_out`.
+
+The cocotb testbench in `test/` covers reset behaviour, hand-checked values
+including the full-range `255*255` case, accumulator wrapping past 16 bits, a
+100-sample random stream checked against a Python reference model, and reset
+part-way through a stream.
 
 ```
-make -B
+cd test && make -B
 ```
-
-For the placeholder design, the test drives `ui_in` and `uio_in` and checks that `uo_out` equals
-their sum.
 
 ## External hardware
 

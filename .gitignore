@@ -12,5 +12,10 @@ test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
 
-# Downloaded CI build artifacts
-build_output/
+# Local build outputs: fetched CI artifacts, PDK, waveforms
+build/
+
+# Local dev helper script (not part of the TT template)
+sim.sh
+test/sdf_annotate.vh
+WORKFLOW.md

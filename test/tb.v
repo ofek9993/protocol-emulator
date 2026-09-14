@@ -35,4 +35,10 @@ module tb ();
       .rst_n  (rst_n)     // not reset
   );
 
+  // SDF timing annotation - inert unless -DUSE_SDF is passed.
+  // Driven by:  ./sim.sh --gates --sdf slow|typ|fast
+`ifdef USE_SDF
+  `include "sdf_annotate.vh"
+`endif
+
 endmodule
