@@ -19,3 +19,4 @@ build/
 sim.sh
 test/sdf_annotate.vh
 WORKFLOW.md
+report.py
