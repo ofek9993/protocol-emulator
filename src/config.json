@@ -32,30 +32,49 @@
   "CLOCK_PORT": "clk",
   "SDC_FILE": "dir::constraints.sdc",
   "//": "---- IHP 1024x8 SRAM hard macro ----",
-  "//": "Views come from the PDK (ihp-sg13g2/libs.ref/sg13g2_sram; cmos5l",
-  "//": "symlinks to it). Macro is 146.88 x 336.46 um, which is why tiles",
-  "//": "must be at least 3x4 - it is taller than any x1 or x2 tile.",
+  "//": "Physical/timing views come straight from the PDK via pdk_dir:: so the",
+  "//": "repo carries no foundry binaries and cannot drift from the PDK. Only",
+  "//": "the small Verilog models are local: a hand-written black box for",
+  "//": "synthesis, and the PDK behavioural model for simulation.",
+  "//": "Macro is 146.88 x 336.46 um - taller than any x1 or x2 tile.",
   "MACROS": {
     "RM_IHPSG13_1P_1024x8_c2_bm_bist": {
-      "gds":   ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist.gds"],
-      "lef":   ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist.lef"],
-      "nl":    ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist.v"],
-      "spice": ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist.cdl"],
+      "gds":   ["pdk_dir::libs.ref/sg13cmos5l_sram/gds/RM_IHPSG13_1P_1024x8_c2_bm_bist.gds"],
+      "lef":   ["pdk_dir::libs.ref/sg13cmos5l_sram/lef/RM_IHPSG13_1P_1024x8_c2_bm_bist.lef"],
+      "spice": ["pdk_dir::libs.ref/sg13cmos5l_sram/cdl/RM_IHPSG13_1P_1024x8_c2_bm_bist.cdl"],
       "lib": {
-        "nom_typ_1p20V_25C":   ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist_typ_1p20V_25C.lib"],
-        "nom_slow_1p08V_125C": ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist_slow_1p08V_125C.lib"],
-        "nom_fast_1p32V_m40C": ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist_fast_1p32V_m55C.lib"]
+        "nom_typ_1p20V_25C":   ["pdk_dir::libs.ref/sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_typ_1p20V_25C.lib"],
+        "nom_slow_1p08V_125C": ["pdk_dir::libs.ref/sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_slow_1p08V_125C.lib"],
+        "nom_fast_1p32V_m40C": ["pdk_dir::libs.ref/sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_fast_1p32V_m55C.lib"]
       },
+      "//": "nl is what synthesis reads. The PDK model cannot be used: its",
+      "//": "specify block uses $setuphold with elided arguments, which Yosys",
+      "//": "cannot parse, and a hard macro should be a black box anyway.",
+      "nl":    ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist_blackbox.v"],
       "instances": {
-        "mem.sram": { "location": [245, 187], "orientation": "N" }
+        "mem.sram": { "location": [400, 180], "orientation": "N" }
       }
     }
   },
 
-  "//": "Let the PDN reach the macro power pins (VDD!/VSS!/VDDARRAY!).",
+  "//": "Map the macro's supply pins onto the PDN nets. PDN_CONNECT_MACROS_TO_GRID",
+  "//": "alone is not enough - it has to be told that VDD!/VDDARRAY!/VSS! are the",
+  "//": "macro-side names for VPWR/VGND.",
   "PDN_CONNECT_MACROS_TO_GRID": true,
-  "FP_MACRO_HORIZONTAL_HALO": 6,
-  "FP_MACRO_VERTICAL_HALO": 6,
+  "PDN_MACRO_CONNECTIONS": [
+    "mem.sram VPWR VGND VDD! VSS!",
+    "mem.sram VPWR VGND VDDARRAY! VSS!"
+  ],
+  "FP_MACRO_HORIZONTAL_HALO": 0,
+  "FP_MACRO_VERTICAL_HALO": 0,
+  "PDN_HORIZONTAL_HALO": 0,
+  "PDN_VERTICAL_HALO": 0,
+
+  "//": "Magic reads the SRAM from its LEF abstract, not the real GDS, so it",
+  "//": "reports overlap false positives on the macro. Treat it as abstract and",
+  "//": "let KLayout DRC be the physical signoff instead.",
+  "MAGIC_EXT_ABSTRACT_CELLS": ["RM_IHPSG13_.*"],
+  "MAGIC_MACRO_STD_CELL_SOURCE": "PDK",
 
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 

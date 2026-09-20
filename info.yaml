@@ -5,10 +5,12 @@ project:
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "1024x8 IHP SRAM scratchpad with auto-incrementing write pointer"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     10000000       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     50000000       # 20 ns CLOCK_PERIOD in src/config.json = 50 MHz
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "3x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "6x4"          # Jane Street rules: current max is 6x4 (8x4 may come later)
+                      # Real CMOS5L list: 1x1 1x2 2x1 2x2 3x1 3x2 3x4 4x1 4x2
+                      #                   4x4 5x4 6x1 6x2 6x4 8x1 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
   top_module:  "tt_um_ofek9993_protoemu"
