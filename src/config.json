@@ -37,6 +37,9 @@
   "//": "the small Verilog models are local: a hand-written black box for",
   "//": "synthesis, and the PDK behavioural model for simulation.",
   "//": "Macro is 146.88 x 336.46 um - taller than any x1 or x2 tile.",
+  "//": "nl (what synthesis reads) is a hand-written black box, not the",
+  "//": "PDK model - its specify block uses $setuphold with elided",
+  "//": "arguments, which Yosys cannot parse.",
   "MACROS": {
     "RM_IHPSG13_1P_1024x8_c2_bm_bist": {
       "gds":   ["pdk_dir::libs.ref/sg13cmos5l_sram/gds/RM_IHPSG13_1P_1024x8_c2_bm_bist.gds"],
@@ -47,9 +50,6 @@
         "nom_slow_1p08V_125C": ["pdk_dir::libs.ref/sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_slow_1p08V_125C.lib"],
         "nom_fast_1p32V_m40C": ["pdk_dir::libs.ref/sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_fast_1p32V_m55C.lib"]
       },
-      "//": "nl is what synthesis reads. The PDK model cannot be used: its",
-      "//": "specify block uses $setuphold with elided arguments, which Yosys",
-      "//": "cannot parse, and a hard macro should be a black box anyway.",
       "nl":    ["dir::../macro/RM_IHPSG13_1P_1024x8_c2_bm_bist/RM_IHPSG13_1P_1024x8_c2_bm_bist_blackbox.v"],
       "instances": {
         "mem.sram": { "location": [400, 180], "orientation": "N" }
