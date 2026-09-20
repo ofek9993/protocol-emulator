@@ -1,14 +1,14 @@
 # Tiny Tapeout project information
 project:
-  title:        "MAC Stress Test"      # Project title
+  title:        "SRAM Scratchpad"      # Project title
   author:       "ofek9993"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "8x8 multiply-accumulate with a 16-bit accumulator"      # One line description of what your project does
+  description:  "1024x8 IHP SRAM scratchpad with auto-incrementing write pointer"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     10000000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "3x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
   top_module:  "tt_um_ofek9993_protoemu"
@@ -18,39 +18,41 @@ project:
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
     - "project.v"
+    - "sram_wrapper.v"
+    - "write_pointer.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "A0"
-  ui[1]: "A1"
-  ui[2]: "A2"
-  ui[3]: "A3"
-  ui[4]: "A4"
-  ui[5]: "A5"
-  ui[6]: "A6"
-  ui[7]: "A7"
+  ui[0]: "WDATA0"
+  ui[1]: "WDATA1"
+  ui[2]: "WDATA2"
+  ui[3]: "WDATA3"
+  ui[4]: "WDATA4"
+  ui[5]: "WDATA5"
+  ui[6]: "WDATA6"
+  ui[7]: "WDATA7"
 
   # Outputs
-  uo[0]: "ACC8"
-  uo[1]: "ACC9"
-  uo[2]: "ACC10"
-  uo[3]: "ACC11"
-  uo[4]: "ACC12"
-  uo[5]: "ACC13"
-  uo[6]: "ACC14"
-  uo[7]: "ACC15"
+  uo[0]: "RDATA0"
+  uo[1]: "RDATA1"
+  uo[2]: "RDATA2"
+  uo[3]: "RDATA3"
+  uo[4]: "RDATA4"
+  uo[5]: "RDATA5"
+  uo[6]: "RDATA6"
+  uo[7]: "RDATA7"
 
   # Bidirectional pins
-  uio[0]: "B0"
-  uio[1]: "B1"
-  uio[2]: "B2"
-  uio[3]: "B3"
-  uio[4]: "B4"
-  uio[5]: "B5"
-  uio[6]: "B6"
-  uio[7]: "B7"
+  uio[0]: "WE"
+  uio[1]: "CLR_PTR"
+  uio[2]: "RADDR0"
+  uio[3]: "RADDR1"
+  uio[4]: "RADDR2"
+  uio[5]: "RADDR3"
+  uio[6]: "RADDR4"
+  uio[7]: "RADDR5"
 
 # Do not change!
 yaml_version: 6
