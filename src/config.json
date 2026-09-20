@@ -57,6 +57,13 @@
     }
   },
 
+  "//": "The default GeneratePDN step's own connectivity check runs BEFORE",
+  "//": "our substituted step gets a chance to bridge the SRAM columns, and by",
+  "//": "default a PDN violation there is fatal and aborts the whole flow -",
+  "//": "meaning our step would never even run. LVS is the real verdict on",
+  "//": "whether power actually reached the macro, not this pre-check.",
+  "ERROR_ON_PDN_VIOLATIONS": 0,
+
   "//": "---- custom PDN step for the SRAM's split-column power pins ----",
   "//": "The default generator cannot handle this macro (see odb_sram_stripes.py",
   "//": "for why) and fails with PDN-0233. This substitutes our own step right",
