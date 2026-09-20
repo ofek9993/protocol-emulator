@@ -20,7 +20,7 @@ the region the default generator left empty.
 """
 import os
 
-from librelane.config import Path, Variable
+from librelane.config import Variable
 from librelane.steps import Step
 from librelane.steps.odb import OdbpyStep
 
@@ -41,11 +41,15 @@ class ExtendSramPowerStripes(OdbpyStep):
             "config.json.",
         ),
         Variable(
-            "SRAM_PDN_LEF",
-            Path,
-            "Path to the SRAM macro's LEF file (same one referenced in "
-            "MACROS.<macro>.lef), used to read the real pin geometry. Needs "
-            "the Path type, not str, for pdk_dir:: to resolve correctly.",
+            "SRAM_PDN_LEF_RELPATH",
+            str,
+            "Path to the SRAM macro's LEF file, relative to $PDK_ROOT/$PDK "
+            "(same file MACROS.<macro>.lef points at via pdk_dir::). A "
+            "typed LibreLane Path variable is deliberately not used here: "
+            "pdk_dir:: resolution needs librelane.config.Path, whose real "
+            "import location isn't documented and turned out to be wrong "
+            "on the first attempt (ImportError). Computing the path in "
+            "plain Python from $PDK_ROOT avoids depending on it.",
         ),
         Variable(
             "SRAM_PDN_LAYER",
@@ -59,8 +63,11 @@ class ExtendSramPowerStripes(OdbpyStep):
         return os.path.join(HERE, "odb_sram_stripes.py")
 
     def get_command(self):
+        pdk_root = os.environ["PDK_ROOT"]
+        pdk = os.environ["PDK"]
+        lef = os.path.join(pdk_root, pdk, self.config["SRAM_PDN_LEF_RELPATH"])
         return super().get_command() + [
             "--instance", self.config["SRAM_PDN_INSTANCE"],
-            "--lef", str(self.config["SRAM_PDN_LEF"]),
+            "--lef", lef,
             "--layer", self.config["SRAM_PDN_LAYER"],
         ]
