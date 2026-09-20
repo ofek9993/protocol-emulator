@@ -57,6 +57,20 @@
     }
   },
 
+  "//": "---- custom PDN step for the SRAM's split-column power pins ----",
+  "//": "The default generator cannot handle this macro (see odb_sram_stripes.py",
+  "//": "for why) and fails with PDN-0233. This substitutes our own step right",
+  "//": "after the default one runs, so the rest of the chip still gets the",
+  "//": "normal grid and only the macro's region is handled specially.",
+  "meta": {
+    "substituting_steps": {
+      "+OpenROAD.GeneratePDN": "Project.ExtendSramPowerStripes"
+    }
+  },
+  "SRAM_PDN_INSTANCE": "mem.sram",
+  "SRAM_PDN_LEF": "pdk_dir::libs.ref/sg13cmos5l_sram/lef/RM_IHPSG13_1P_1024x8_c2_bm_bist.lef",
+  "SRAM_PDN_LAYER": "Metal4",
+
   "//": "Map the macro's supply pins onto the PDN nets. PDN_CONNECT_MACROS_TO_GRID",
   "//": "alone is not enough - it has to be told that VDD!/VDDARRAY!/VSS! are the",
   "//": "macro-side names for VPWR/VGND.",
