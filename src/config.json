@@ -57,12 +57,13 @@
     }
   },
 
-  "//": "The default GeneratePDN step's own connectivity check runs BEFORE",
-  "//": "our substituted step gets a chance to bridge the SRAM columns, and by",
-  "//": "default a PDN violation there is fatal and aborts the whole flow -",
-  "//": "meaning our step would never even run. LVS is the real verdict on",
-  "//": "whether power actually reached the macro, not this pre-check.",
-  "ERROR_ON_PDN_VIOLATIONS": 0,
+  "//": "The generic macro grid LibreLane's default pdn_cfg.tcl defines is",
+  "//": "exactly what fails (PDN-0232/0233) - it assumes one uniform pin",
+  "//": "pattern for every macro, which this SRAM does not have. Our own",
+  "//": "pdn_cfg.tcl is that default with just the macro-grid block removed,",
+  "//": "so GeneratePDN succeeds and our substituted step can then draw the",
+  "//": "SRAM's real stripes from its actual LEF geometry.",
+  "PDN_CFG": "dir::pdn_cfg.tcl",
 
   "//": "---- custom PDN step for the SRAM's split-column power pins ----",
   "//": "The default generator cannot handle this macro (see odb_sram_stripes.py",
