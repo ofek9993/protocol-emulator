@@ -63,6 +63,8 @@
   "//": "after the default one runs, so the rest of the chip still gets the",
   "//": "normal grid and only the macro's region is handled specially.",
   "meta": {
+    "version": 2,
+    "flow": "Classic",
     "substituting_steps": {
       "+OpenROAD.GeneratePDN": "Project.ExtendSramPowerStripes"
     }
