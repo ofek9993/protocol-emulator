@@ -20,7 +20,7 @@ the region the default generator left empty.
 """
 import os
 
-from librelane.config import Variable
+from librelane.config import Path, Variable
 from librelane.steps import Step
 from librelane.steps.odb import OdbpyStep
 
@@ -42,9 +42,10 @@ class ExtendSramPowerStripes(OdbpyStep):
         ),
         Variable(
             "SRAM_PDN_LEF",
-            str,
+            Path,
             "Path to the SRAM macro's LEF file (same one referenced in "
-            "MACROS.<macro>.lef), used to read the real pin geometry.",
+            "MACROS.<macro>.lef), used to read the real pin geometry. Needs "
+            "the Path type, not str, for pdk_dir:: to resolve correctly.",
         ),
         Variable(
             "SRAM_PDN_LAYER",
@@ -60,6 +61,6 @@ class ExtendSramPowerStripes(OdbpyStep):
     def get_command(self):
         return super().get_command() + [
             "--instance", self.config["SRAM_PDN_INSTANCE"],
-            "--lef", self.config["SRAM_PDN_LEF"],
+            "--lef", str(self.config["SRAM_PDN_LEF"]),
             "--layer", self.config["SRAM_PDN_LAYER"],
         ]
