@@ -34,13 +34,6 @@ class ExtendSramPowerStripes(OdbpyStep):
 
     config_vars = [
         Variable(
-            "SRAM_PDN_INSTANCE",
-            str,
-            "Hierarchical instance name of the SRAM macro to power, e.g. "
-            "mem.sram. Must match a MACROS.<macro>.instances key in "
-            "config.json.",
-        ),
-        Variable(
             "SRAM_PDN_LEF_RELPATH",
             str,
             "Path to the SRAM macro's LEF file, relative to $PDK_ROOT/$PDK "
@@ -54,8 +47,16 @@ class ExtendSramPowerStripes(OdbpyStep):
         Variable(
             "SRAM_PDN_LAYER",
             str,
-            "PDN layer the macro's power pins are drawn on.",
+            "Vertical PDN layer the macro's supply columns are on.",
             default="Metal4",
+        ),
+        Variable(
+            "SRAM_PDN_MIN_PAIRS",
+            int,
+            "Minimum VPWR/VGND column pairs to drive per macro. The SRAM "
+            "distributes power internally, so every legal column does not "
+            "need its own stripe.",
+            default=2,
         ),
     ]
 
@@ -87,7 +88,7 @@ class ExtendSramPowerStripes(OdbpyStep):
             str(pdk_root), str(pdk), self.config["SRAM_PDN_LEF_RELPATH"]
         )
         return super().get_command() + [
-            "--instance", self.config["SRAM_PDN_INSTANCE"],
             "--lef", lef,
             "--layer", self.config["SRAM_PDN_LAYER"],
+            "--min-pairs", str(self.config["SRAM_PDN_MIN_PAIRS"]),
         ]

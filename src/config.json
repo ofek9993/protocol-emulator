@@ -76,7 +76,6 @@
       "+OpenROAD.GeneratePDN": "Project.ExtendSramPowerStripes"
     }
   },
-  "SRAM_PDN_INSTANCE": "mem.sram",
   "SRAM_PDN_LEF_RELPATH": "libs.ref/sg13cmos5l_sram/lef/RM_IHPSG13_1P_1024x8_c2_bm_bist.lef",
   "SRAM_PDN_LAYER": "Metal4",
 
