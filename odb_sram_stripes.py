@@ -72,20 +72,53 @@ def _pin_rects(text, name):
     ]
 
 
+def _spans_whole(spans, height, tol=0.5):
+    """True only if the pin metal runs the macro's full height unbroken.
+
+    VDD! and VDDARRAY! share x positions on 8 columns: VDD! stops at y
+    38.825 and VDDARRAY! resumes at 45.465, and the macro routes its own
+    metal through that break. Merging the two by min/max would hide the gap
+    and make such a column look full height, which is how a stripe ended up
+    crossing the break and shorting VPWR to VGND.
+    """
+    if not spans:
+        return False
+    merged = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1] + tol:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return (len(merged) == 1
+            and merged[0][0] <= tol
+            and merged[0][1] >= height - tol)
+
+
 def legal_columns(lef_path, layer="Metal4"):
     """Legal supply columns in the macro's own frame, in microns.
 
-    Returns [(x0, x1, net)] - the Metal4 OBS gaps, each tagged with the net
-    of the declared pin inside it. Pin names end in '!', which is not a word
+    Returns [(x0, x1, net, full_height)] - the Metal4 OBS gaps, each tagged
+    with the net of the declared pin inside it and whether that pin spans the
+    whole macro (only those may carry a full-height stripe). Pin names end in '!', which is not a word
     character, so pin blocks are matched on whole lines rather than with a
     \\b anchor (a \\b after '!' can never match).
     """
     text = open(lef_path, encoding="utf-8", errors="replace").read()
 
+    size = re.search(r"SIZE\s+([\d.]+)\s+BY\s+([\d.]+)", text)
+    if size is None:
+        raise click.ClickException(f"{lef_path}: no SIZE line")
+    height = float(size.group(2))
+
+    # Keep each pin's y-extent: a column is only safe to drive full height if
+    # its pin runs the whole macro. VDD! stops at y 38.825 on 8 of its 12
+    # columns, with VDDARRAY! resuming at 45.465 - the macro routes its own
+    # metal through that break, so a stripe crossing it shorts VPWR to VGND.
     polarity = {}
     for pin_name, net in PIN_TO_NET.items():
-        for x0, _y0, x1, _y1 in _pin_rects(text, pin_name):
-            polarity[(round(x0, 3), round(x1, 3))] = net
+        for x0, y0, x1, y1 in _pin_rects(text, pin_name):
+            key = (round(x0, 3), round(x1, 3))
+            polarity.setdefault(key, (net, []))[1].append((y0, y1))
     if not polarity:
         raise click.ClickException(
             f"{lef_path}: no VDD!/VDDARRAY!/VSS! pins found - wrong LEF?"
@@ -106,11 +139,13 @@ def legal_columns(lef_path, layer="Metal4"):
         if b0 - a1 <= 0 or b0 - a1 > MAX_CORRIDOR_UM:
             continue
         inside = [
-            net for (p0, p1), net in polarity.items()
+            v for (p0, p1), v in polarity.items()
             if p0 >= a1 - 0.01 and p1 <= b0 + 0.01
         ]
         if len(inside) == 1:
-            columns.append((round(a1, 3), round(b0, 3), inside[0]))
+            net, spans = inside[0]
+            columns.append(
+                (round(a1, 3), round(b0, 3), net, _spans_whole(spans, height)))
     if not columns:
         raise click.ClickException(
             f"{lef_path}: no legal {layer} corridors found between OBS bars"
@@ -213,9 +248,12 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
         raise click.ClickException("no SRAM macro instance found in the design")
 
     master_cols = legal_columns(lef, layer)
-    click.echo(f"[sram-pdn] {len(master_cols)} legal {layer} columns in the LEF "
-               f"({sum(1 for c in master_cols if c[2]=='VPWR')} VPWR / "
-               f"{sum(1 for c in master_cols if c[2]=='VGND')} VGND)")
+    usable = [c for c in master_cols if c[3]]
+    click.echo(
+        f"[sram-pdn] {len(master_cols)} legal {layer} columns in the LEF; "
+        f"{len(usable)} usable full height "
+        f"({sum(1 for c in usable if c[2]=='VPWR')} VPWR / "
+        f"{sum(1 for c in usable if c[2]=='VGND')} VGND)")
 
     nets = {}
     for net_name in ("VPWR", "VGND"):
@@ -232,8 +270,19 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
         ox = ib.xMin()
         cols_dbu = [
             (ox + int(round(x0 * dbu)), ox + int(round(x1 * dbu)), net)
-            for x0, x1, net in master_cols
+            for x0, x1, net, full in master_cols if full
         ]
+        skipped = sum(1 for c in master_cols if not c[3])
+        if skipped:
+            click.echo(
+                f"[sram-pdn] skipping {skipped} column(s) whose pin does not "
+                "span the macro: a full-height stripe there would cross the "
+                "VDD!/VDDARRAY! break and short to the macro's own metal"
+            )
+        if not cols_dbu:
+            raise click.ClickException(
+                "no full-height legal columns available for stripes"
+            )
 
         crossing_centres = {}
         crossing_boxes = {}
