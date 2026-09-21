@@ -93,6 +93,15 @@
   "PDN_HORIZONTAL_HALO": 0,
   "PDN_VERTICAL_HALO": 0,
 
+  "//": "Without this Magic streams in the SRAM's entire internal layout -",
+  "//": "bit cells, decoders, vias, 80k+ instances - and runs full DRC over",
+  "//": "it. That is pointless (the macro is pre-hardened foundry IP that is",
+  "//": "already signed off), extremely slow (it ran 15 minutes without",
+  "//": "finishing, against 5-8 for a normal build), and prone to false",
+  "//": "positives. 0 makes Magic check the top-level DEF/LEF integration",
+  "//": "view instead: our own layout, with the macro as an abstract box.",
+  "MAGIC_DRC_USE_GDS": 0,
+
   "//": "Magic reads the SRAM from its LEF abstract, not the real GDS, so it",
   "//": "reports overlap false positives on the macro. Treat it as abstract and",
   "//": "let KLayout DRC be the physical signoff instead.",
