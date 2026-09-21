@@ -320,10 +320,26 @@ def build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um=2.1,
                 if b.getTechLayer() is not None
                 and b.getTechLayer().getName() == "Metal1"
             ]
+            # Remove the crossing stripes AND the via stacks that fed them.
+            # Leaving the vias behind strands them under no stripe and puts
+            # them right next to the new ones, which is what produced the
+            # Metal1/Via1/via2/via3 spacing violations (M1.b, V1.b, V2.b,
+            # V3.b) - all on the via layers, none on Metal4.
+            removed_x = [(b.xMin(), b.xMax()) for b in crossing_boxes[net_name]]
             removed = 0
             for b in crossing_boxes[net_name]:
                 odb.dbSBox_destroy(b)
                 removed += 1
+
+            def _was_under_removed(box):
+                bx = _centre(box.xMin(), box.xMax())
+                return any(x0 <= bx <= x1 for x0, x1 in removed_x)
+
+            stale_vias = 0
+            for b in list(swire.getWires()):
+                if b.getTechLayer() is None and _was_under_removed(b):
+                    odb.dbSBox_destroy(b)
+                    stale_vias += 1
 
             placed = vias = 0
             for x0, x1, _net in chosen[net_name]:
@@ -355,8 +371,8 @@ def build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um=2.1,
             click.echo(
                 f"[sram-pdn] {inst.getName()} {net_name}: removed {removed} "
                 f"crossing tile stripe(s), placed {placed} column stripe(s) "
-                f"of width {stripe_width_um}um (corridors are "
-                f"{(chosen[net_name][0][1]-chosen[net_name][0][0])/dbu:.2f}um) "
+                f"of width {stripe_width_um}um, dropped {stale_vias} "
+                f"stranded via stack(s) "
                 f"at x=" + ", ".join(
                     f"{_centre(c[0], c[1])/dbu:.2f}" for c in chosen[net_name])
                 + f" um, {vias} rail via stack(s)"
