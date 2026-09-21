@@ -118,7 +118,8 @@ def legal_columns(lef_path, layer="Metal4"):
     for pin_name, net in PIN_TO_NET.items():
         for x0, y0, x1, y1 in _pin_rects(text, pin_name):
             key = (round(x0, 3), round(x1, 3))
-            polarity.setdefault(key, (net, []))[1].append((y0, y1))
+            polarity.setdefault(key, (net, [], set()))[1].append((y0, y1))
+            polarity[key][2].add(pin_name)
     if not polarity:
         raise click.ClickException(
             f"{lef_path}: no VDD!/VDDARRAY!/VSS! pins found - wrong LEF?"
@@ -143,9 +144,9 @@ def legal_columns(lef_path, layer="Metal4"):
             if p0 >= a1 - 0.01 and p1 <= b0 + 0.01
         ]
         if len(inside) == 1:
-            net, spans = inside[0]
-            columns.append(
-                (round(a1, 3), round(b0, 3), net, _spans_whole(spans, height)))
+            net, spans, pin_names = inside[0]
+            columns.append((round(a1, 3), round(b0, 3), net,
+                            _spans_whole(spans, height), frozenset(pin_names)))
     if not columns:
         raise click.ClickException(
             f"{lef_path}: no legal {layer} corridors found between OBS bars"
@@ -218,7 +219,8 @@ def allocate(columns_dbu, crossing_centres, min_pairs, pair_gap):
 
 
 # ------------------------------------------------------------------- main
-def build(reader, lef, layer, min_pairs, pair_gap_um):
+def build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um=2.1,
+          min_clearance_um=0.21):
     block = reader.block
     dbu = block.getDefUnits()
     m4 = reader.tech.findLayer(layer)
@@ -248,12 +250,11 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
         raise click.ClickException("no SRAM macro instance found in the design")
 
     master_cols = legal_columns(lef, layer)
-    usable = [c for c in master_cols if c[3]]
     click.echo(
-        f"[sram-pdn] {len(master_cols)} legal {layer} columns in the LEF; "
-        f"{len(usable)} usable full height "
-        f"({sum(1 for c in usable if c[2]=='VPWR')} VPWR / "
-        f"{sum(1 for c in usable if c[2]=='VGND')} VGND)")
+        f"[sram-pdn] {len(master_cols)} legal {layer} columns in the LEF "
+        f"({sum(1 for c in master_cols if c[2]=='VPWR')} VPWR / "
+        f"{sum(1 for c in master_cols if c[2]=='VGND')} VGND); "
+        f"{sum(1 for c in master_cols if 'VDDARRAY!' in c[4])} carry VDDARRAY!")
 
     nets = {}
     for net_name in ("VPWR", "VGND"):
@@ -268,21 +269,21 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
     for inst in srams:
         ib = inst.getBBox()
         ox = ib.xMin()
+        # Every column is usable. Filtering out the ones whose VDD! stops at
+        # y 38.825 looked safe but starved the macro: VDDARRAY!, which feeds
+        # the bit-cell array, exists ONLY on those columns, and dropping them
+        # left "[PSM-0039] Unconnected instance mem.sram/VDDARRAY!". A stripe
+        # there does cross the obstruction bar in the break, which Magic
+        # reports as an illegal overlap, but the bar is a keep-out in the LEF
+        # abstract rather than conflicting metal in the real GDS.
         cols_dbu = [
             (ox + int(round(x0 * dbu)), ox + int(round(x1 * dbu)), net)
-            for x0, x1, net, full in master_cols if full
+            for x0, x1, net, _full, _pins in master_cols
         ]
-        skipped = sum(1 for c in master_cols if not c[3])
-        if skipped:
-            click.echo(
-                f"[sram-pdn] skipping {skipped} column(s) whose pin does not "
-                "span the macro: a full-height stripe there would cross the "
-                "VDD!/VDDARRAY! break and short to the macro's own metal"
-            )
-        if not cols_dbu:
-            raise click.ClickException(
-                "no full-height legal columns available for stripes"
-            )
+        vddarray_x = {
+            ox + int(round((x0 + x1) / 2 * dbu))
+            for x0, x1, _n, _f, pins in master_cols if "VDDARRAY!" in pins
+        }
 
         crossing_centres = {}
         crossing_boxes = {}
@@ -297,6 +298,22 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
 
         chosen = allocate(cols_dbu, crossing_centres, min_pairs, pair_gap)
 
+        # VDDARRAY! is a separate supply inside the macro; make sure at least
+        # one chosen column actually carries it.
+        if vddarray_x and not any(
+                _centre(c[0], c[1]) in vddarray_x for c in chosen["VPWR"]):
+            extra = next(
+                (c for c in cols_dbu
+                 if c[2] == "VPWR" and _centre(c[0], c[1]) in vddarray_x
+                 and c not in chosen["VPWR"]), None)
+            if extra is not None:
+                chosen["VPWR"].append(extra)
+                click.echo(
+                    f"[sram-pdn] added a VDDARRAY! column at "
+                    f"x={_centre(extra[0], extra[1])/dbu:.2f}um so the "
+                    "bit-cell array supply is driven"
+                )
+
         for net_name, (_net, swire) in nets.items():
             rails = [
                 b for b in swire.getWires()
@@ -310,9 +327,23 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
 
             placed = vias = 0
             for x0, x1, _net in chosen[net_name]:
-                odb.dbSBox_create(swire, m4, x0, ylo, x1, yhi, "STRIPE")
-                placed += 1
+                # Centre a stripe of the grid's own width inside the corridor
+                # rather than filling it. The corridor is 3.33um wide and the
+                # macro's internal metal sits immediately either side of it,
+                # alternating VPWR/VGND - filling it edge to edge leaves no
+                # clearance and shorts the two together, which is what LVS
+                # caught. The LEF's own rule is "LAYER Metal4 SPACING 0.21".
                 cx = _centre(x0, x1)
+                half = min(int(stripe_width_um * dbu) // 2,
+                           (x1 - x0) // 2 - int(min_clearance_um * dbu))
+                if half <= 0:
+                    raise click.ClickException(
+                        f"corridor at x={cx/dbu:.2f}um is too narrow for a "
+                        f"stripe with {min_clearance_um}um clearance"
+                    )
+                odb.dbSBox_create(swire, m4, cx - half, ylo, cx + half, yhi,
+                                  "STRIPE")
+                placed += 1
                 for r in rails:
                     # only outside the macro: no cell rows run underneath it
                     if r.xMin() <= cx <= r.xMax() and (
@@ -324,6 +355,8 @@ def build(reader, lef, layer, min_pairs, pair_gap_um):
             click.echo(
                 f"[sram-pdn] {inst.getName()} {net_name}: removed {removed} "
                 f"crossing tile stripe(s), placed {placed} column stripe(s) "
+                f"of width {stripe_width_um}um (corridors are "
+                f"{(chosen[net_name][0][1]-chosen[net_name][0][0])/dbu:.2f}um) "
                 f"at x=" + ", ".join(
                     f"{_centre(c[0], c[1])/dbu:.2f}" for c in chosen[net_name])
                 + f" um, {vias} rail via stack(s)"
@@ -340,9 +373,12 @@ def _cli():
                        "the macro's internal mesh carries the rest")
     @click.option("--pair-gap-um", default=6.5, type=float,
                   help="Max centre spacing for two columns to count as a pair")
+    @click.option("--stripe-width-um", default=2.1, type=float,
+                  help="Stripe width, centred in the corridor. Must leave "
+                       "clearance to the macro's internal metal either side")
     @click_odb
-    def run(reader, lef, layer, min_pairs, pair_gap_um):
-        build(reader, lef, layer, min_pairs, pair_gap_um)
+    def run(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um):
+        build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um)
 
     return run
 
