@@ -103,8 +103,12 @@
     "mem.sram VPWR VGND VDD! VSS!",
     "mem.sram VPWR VGND VDDARRAY! VSS!"
   ],
-  "FP_MACRO_HORIZONTAL_HALO": 0,
-  "FP_MACRO_VERTICAL_HALO": 0,
+  "//": "Small halo so standard cells don't get placed flush against the",
+  "//": "macro - KLayout DRC found 368 NW.b (N-well spacing, min 0.62um)",
+  "//": "violations at the macro's right edge, all in one place, consistent",
+  "//": "with a cell's own N-well nearly touching the macro's at zero halo.",
+  "FP_MACRO_HORIZONTAL_HALO": 1,
+  "FP_MACRO_VERTICAL_HALO": 1,
   "PDN_HORIZONTAL_HALO": 0,
   "PDN_VERTICAL_HALO": 0,
 
