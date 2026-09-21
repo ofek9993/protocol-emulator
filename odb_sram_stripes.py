@@ -1,36 +1,35 @@
-# Draw Metal4 PDN stripes over the IHP SRAM macro's real power pins.
+# Draw Metal4 PDN stripes over the IHP SRAM macro's real power columns.
 #
-# The default PDN generator assumes one uniform column pattern per net and
-# fails outright on this macro's layout:
+# LibreLane's default pdn_cfg.tcl ends with a generic
+#   define_pdn_grid -macro -default ...
+# that grids every macro with one uniform pattern. This macro does not fit
+# that pattern, so it produced PDN-0232/0233. src/pdn_cfg.tcl drops that
+# block; this step fills the gap it leaves.
 #
-#   VDD!       12 columns, but two different heights:
-#                4 short  (y:  0      -> 38.825, the periphery band)
-#                8 tall   (y:  0      -> full macro height)
-#   VSS!       12 columns, all full height
-#   VDDARRAY!   8 columns, all starting at y: 45.465 (not 0) -> full height
+# The macro's power face, read out of its LEF (32 rects, verified):
 #
-# [PDN-0232] "grid does not contain any shapes or vias" / [PDN-0233] "Failed
-# to generate full power grid" is what LibreLane's default generator reports
-# on any macro whose pins don't fit that single-pattern assumption - this is
-# not specific to this macro size; every IHP single-port SRAM shares the same
-# split-column convention (verified against six sizes from 64x16 to 2048x32).
+#   VDD!       12 columns - 4 short (y 0 -> 38.825, the periphery band)
+#                           8 tall  (y 0 -> 336.46)
+#   VSS!       12 columns - all tall
+#   VDDARRAY!   8 columns - all starting at y 45.465, not 0
 #
-# Method:
-#   1. Read the macro's LEF once, in its own local (master) coordinate frame.
-#   2. Look up the instance's actual placement (origin + orientation) from
-#      the live database - never hardcoded, so this keeps working if the
-#      macro is moved or reconfigured in config.json.
-#   3. Transform each pin rectangle into chip coordinates and classify it
-#      onto VPWR or VGND.
-#   4. Draw a special-net stripe on Metal4 at each transformed column, with a
-#      via down to the layer below so it actually connects to the existing
-#      grid rather than sitting isolated on top of it.
+# The short VDD! columns and the VDDARRAY! columns share x positions: VDD!
+# feeds the periphery at the bottom, VDDARRAY! takes over above the break at
+# y 38.825..45.465 and feeds the bit-cell array. Both are power, so one
+# full-height stripe per column covers both.
+#
+# Method: parse the LEF in the macro's own (master) coordinates, look up
+# where the instance is actually placed from the live database, translate,
+# then draw one stripe per column. Placement is never hardcoded, so moving
+# the macro in config.json needs no change here.
 import re
+from collections import defaultdict
 
 import click
 import odb
 from reader import click_odb
 
+# Macro-side pin name -> the design's PDN net.
 PIN_TO_NET = {
     "VDD!": "VPWR",
     "VDDARRAY!": "VPWR",
@@ -39,104 +38,132 @@ PIN_TO_NET = {
 
 
 def read_lef_pin_rects(lef_path, pin_names):
-    """Master-frame (x0, y0, x1, y1) rects for the given PIN names.
+    """Master-frame rects, in microns, for each named LEF PIN.
 
-    Parses the LEF text directly rather than relying on an odb LEF reader
-    API being available in this step's environment, and because the LEF is
-    the authoritative, simplest source for pin geometry - it's exactly what
-    we inspected by hand to find this pattern in the first place.
+    The LEF text is parsed directly: it is the authoritative source for this
+    geometry and needs no tool state. Note the pin names end in '!', which
+    is not a word character - a \\b anchor after them can never match, so
+    the block is delimited on whole lines instead.
     """
     text = open(lef_path, encoding="utf-8", errors="replace").read()
-    out = {name: [] for name in pin_names}
+    out = {}
     for name in pin_names:
         m = re.search(
-            r"PIN " + re.escape(name) + r"\b(.*?)END " + re.escape(name) + r"\b",
-            text, re.S,
+            r"^\s*PIN\s+" + re.escape(name) + r"\s*$(.*?)^\s*END\s+"
+            + re.escape(name) + r"\s*$",
+            text, re.S | re.M,
         )
         if not m:
+            out[name] = []
             continue
-        for r in re.findall(
-            r"RECT\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", m.group(1)
-        ):
-            x0, y0, x1, y1 = map(float, r)
-            out[name].append((x0, y0, x1, y1))
+        out[name] = [
+            tuple(map(float, r))
+            for r in re.findall(
+                r"RECT\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*;",
+                m.group(1),
+            )
+        ]
     return out
 
 
-def find_instance(block, inst_name):
+def instance_placement(block, inst_name):
     inst = block.findInst(inst_name)
     if inst is None:
-        raise click.ClickException(f"instance {inst_name!r} not found in the design")
-    return inst
+        raise click.ClickException(
+            f"instance {inst_name!r} not found - it must match a "
+            "MACROS.<macro>.instances key in config.json"
+        )
+    origin = inst.getOrigin()
+    orient = str(inst.getOrient())
+    return inst, (int(origin[0]), int(origin[1])), orient
 
 
-def transform_rect(inst, x0, y0, x1, y1):
-    """Map a master-frame rect through the instance's live placement."""
-    t = inst.getTransform()
-    px0, py0 = t.apply(odb.Point(int(x0), int(y0)))
-    px1, py1 = t.apply(odb.Point(int(x1), int(y1)))
-    return (min(px0, px1), min(py0, py1), max(px0, px1), max(py0, py1))
+def make_to_chip(origin, orient, dbu):
+    """Micron master coordinates -> database-unit chip coordinates.
+
+    Only the unrotated orientations are handled, because that is what this
+    design uses and an unverified rotation would silently place stripes in
+    the wrong spot rather than fail.
+    """
+    if orient not in ("R0", "N"):
+        raise click.ClickException(
+            f"instance orientation {orient!r} is not supported by this step; "
+            "only R0/N has been verified. Add and test the transform before "
+            "using a rotated or mirrored placement."
+        )
+    ox, oy = origin
+
+    def to_chip(x_um, y_um):
+        return ox + int(round(x_um * dbu)), oy + int(round(y_um * dbu))
+
+    return to_chip
 
 
 @click.command()
-@click.option("--instance", required=True, help="Macro instance name, e.g. mem.sram")
+@click.option("--instance", required=True, help="Macro instance, e.g. mem.sram")
 @click.option("--lef", required=True, help="Path to the macro LEF")
-@click.option("--layer", default="Metal4", help="PDN layer the macro pins are on")
-@click.option("--width-um", default=2.81, type=float,
-              help="Stripe width in microns (matches the macro's own pin width)")
+@click.option("--layer", default="Metal4", help="Layer the macro's power pins are on")
+@click.option("--extend-um", default=5.0, type=float,
+              help="How far to extend each stripe past the macro, in microns, "
+                   "so it reaches the standard-cell rails outside the footprint")
 @click_odb
-def extend(reader, instance, lef, layer, width_um):
+def extend(reader, instance, lef, layer, extend_um):
     block = reader.block
-    tech = reader.tech
     dbu = block.getDefUnits()
 
-    tech_layer = tech.findLayer(layer)
+    tech_layer = reader.tech.findLayer(layer)
     if tech_layer is None:
         raise click.ClickException(f"tech layer {layer!r} not found")
 
-    inst = find_instance(block, instance)
-    pins = read_lef_pin_rects(lef, list(PIN_TO_NET))
+    inst, origin, orient = instance_placement(block, instance)
+    to_chip = make_to_chip(origin, orient, dbu)
 
-    total_found = sum(len(v) for v in pins.values())
-    if total_found == 0:
+    pins = read_lef_pin_rects(lef, list(PIN_TO_NET))
+    found = {k: len(v) for k, v in pins.items()}
+    if not sum(found.values()):
         raise click.ClickException(
-            f"no VDD!/VSS!/VDDARRAY! rects found in {lef} - "
-            "is this the right macro LEF?"
+            f"no VDD!/VSS!/VDDARRAY! rects found in {lef} - wrong LEF?"
         )
-    click.echo(f"[sram-pdn] {total_found} pin rects found in {lef}")
+    click.echo(f"[sram-pdn] LEF rects: {found}")
+    click.echo(f"[sram-pdn] {instance} at {origin} dbu, orientation {orient}, "
+               f"{dbu} dbu/um")
+
+    # Collapse the rects into one stripe per column per net: a column's short
+    # VDD! and the VDDARRAY! above it are both power and share an x position.
+    columns = defaultdict(lambda: [None, None])  # (net, x0, x1) -> [ymin, ymax]
+    for pin_name, rects in pins.items():
+        net_name = PIN_TO_NET[pin_name]
+        for x0, y0, x1, y1 in rects:
+            key = (net_name, round(x0, 3), round(x1, 3))
+            span = columns[key]
+            span[0] = y0 if span[0] is None else min(span[0], y0)
+            span[1] = y1 if span[1] is None else max(span[1], y1)
 
     nets = {}
-    for net_name in ("VPWR", "VGND"):
+    for net_name in sorted({n for n, _, _ in columns}):
         net = block.findNet(net_name)
         if net is None:
             raise click.ClickException(
-                f"net {net_name!r} not found - expected the stdcell PDN to "
+                f"net {net_name!r} not found - the standard-cell PDN should "
                 "have created it already"
             )
-        nets[net_name] = net
+        nets[net_name] = odb.dbSWire.create(net, "ROUTED")
 
-    swires = {
-        name: odb.dbSWire.create(net, "ROUTED")
-        for name, net in nets.items()
-    }
-
-    drawn = 0
-    for pin_name, rects in pins.items():
-        net_name = PIN_TO_NET[pin_name]
-        swire = swires[net_name]
-        for x0, y0, x1, y1 in rects:
-            cx0, cy0, cx1, cy1 = transform_rect(inst, x0, y0, x1, y1)
-            odb.dbSBox.create(
-                swire, tech_layer,
-                int(cx0 * dbu / 1000), int(cy0 * dbu / 1000),
-                int(cx1 * dbu / 1000), int(cy1 * dbu / 1000),
-                "STRIPE",
-            )
-            drawn += 1
+    drawn = defaultdict(int)
+    for (net_name, x0, x1), (ymin, ymax) in sorted(columns.items()):
+        cx0, cy0 = to_chip(x0, ymin - extend_um)
+        cx1, cy1 = to_chip(x1, ymax + extend_um)
+        odb.dbSBox.create(
+            nets[net_name], tech_layer,
+            min(cx0, cx1), min(cy0, cy1), max(cx0, cx1), max(cy0, cy1),
+            "STRIPE",
+        )
+        drawn[net_name] += 1
 
     click.echo(
-        f"[sram-pdn] drew {drawn} stripes on {layer} for instance {instance} "
-        f"(origin {inst.getOrigin()}, orientation {inst.getOrient()})"
+        "[sram-pdn] drew " +
+        ", ".join(f"{n} {c} stripes" for n, c in sorted(drawn.items())) +
+        f" on {layer}, each extended {extend_um}um past the macro"
     )
 
 
