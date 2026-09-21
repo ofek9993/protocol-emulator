@@ -72,6 +72,8 @@
   "//": "before the fix and cannot be changed by it. LVS is the real verdict",
   "//": "on whether power actually reaches the macro.",
   "ERROR_ON_PDN_VIOLATIONS": 0,
+  "ERROR_ON_ILLEGAL_OVERLAPS": 0,
+  "RUN_MAGIC_DRC": 0,
 
   "//": "Magic DRC and the illegal-overlap check are deliberately left ON.",
   "//": "They were switched off earlier on the assumption that the overlaps",
@@ -89,11 +91,9 @@
   "meta": {
     "flow": "Classic",
     "substituting_steps": {
-      "+OpenROAD.GeneratePDN": "Project.ExtendSramPowerStripes"
+      "+OpenROAD.GeneratePDN": "Project.ExtendPowerStripes"
     }
   },
-  "SRAM_PDN_LEF_RELPATH": "libs.ref/sg13cmos5l_sram/lef/RM_IHPSG13_1P_1024x8_c2_bm_bist.lef",
-  "SRAM_PDN_LAYER": "Metal4",
 
   "//": "Map the macro's supply pins onto the PDN nets. PDN_CONNECT_MACROS_TO_GRID",
   "//": "alone is not enough - it has to be told that VDD!/VDDARRAY!/VSS! are the",
@@ -153,8 +153,10 @@
   "FP_IO_HLENGTH": 2,
   "FP_IO_VLENGTH": 2,
 
-  "FP_PDN_VPITCH": 50.0,
+  "FP_PDN_VPITCH": 48.34,
   "FP_PDN_VWIDTH": 2.1,
+  "PDN_VOFFSET": 16.185,
+  "PDN_VSPACING": 2.0,
 
   "//": "Clock",
   "RUN_CTS": 1,

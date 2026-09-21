@@ -1,22 +1,17 @@
 """
-LibreLane plugin: draw Metal4 PDN stripes over the IHP SRAM's real power
-columns, since the default generator fails on this macro's split-column
-layout (see odb_sram_stripes.py for why).
+LibreLane plugin: rewrite Metal4 PDN stripes onto the IHP SRAM's power columns.
 
-LibreLane auto-imports every module on the Python path whose name starts
-with ``librelane_plugin_`` (librelane/plugins.py). ``python -m librelane``
-and the Tiny Tapeout GDS action both run from the repository root, so this
-file is found with no install step. src/config.json inserts the step right
-after the default PDN generator:
+LibreLane imports every module on the Python path whose name starts with
+``librelane_plugin_`` (librelane/plugins.py).  ``python -m librelane`` and the
+Tiny Tapeout GDS action both run from the repository root, so this file is
+found without installing anything.  ``src/config.json`` inserts the step
+after GeneratePDN:
 
     "meta": {
       "substituting_steps": {
-        "+OpenROAD.GeneratePDN": "Project.ExtendSramPowerStripes"
+        "+OpenROAD.GeneratePDN": "Project.ExtendPowerStripes"
       }
     }
-
-so the normal grid is built everywhere first, and this step only fills in
-the region the default generator left empty.
 """
 import os
 
@@ -28,34 +23,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 @Step.factory.register()
-class ExtendSramPowerStripes(OdbpyStep):
-    id = "Project.ExtendSramPowerStripes"
-    name = "Extend Power Stripes Over IHP SRAM"
+class ExtendPowerStripes(OdbpyStep):
+    id = "Project.ExtendPowerStripes"
+    name = "Extend Power Stripes Over SRAM"
 
     config_vars = [
         Variable(
-            "SRAM_PDN_LEF_RELPATH",
-            str,
-            "Path to the SRAM macro's LEF file, relative to $PDK_ROOT/$PDK "
-            "(same file MACROS.<macro>.lef points at via pdk_dir::). A "
-            "typed LibreLane Path variable is deliberately not used here: "
-            "pdk_dir:: resolution needs librelane.config.Path, whose real "
-            "import location isn't documented and turned out to be wrong "
-            "on the first attempt (ImportError). Computing the path in "
-            "plain Python from $PDK_ROOT avoids depending on it.",
-        ),
-        Variable(
-            "SRAM_PDN_LAYER",
-            str,
-            "Vertical PDN layer the macro's supply columns are on.",
-            default="Metal4",
-        ),
-        Variable(
             "SRAM_PDN_MIN_PAIRS",
             int,
-            "Minimum VPWR/VGND column pairs to drive per macro. The SRAM "
-            "distributes power internally, so every legal column does not "
-            "need its own stripe.",
+            "Minimum VPWR/VGND column pairs the SRAM gets in each of its "
+            "regions (array L / band / array R).",
             default=2,
         ),
     ]
@@ -63,32 +40,42 @@ class ExtendSramPowerStripes(OdbpyStep):
     def get_script_path(self):
         return os.path.join(HERE, "odb_sram_stripes.py")
 
-    def _lookup(self, key):
-        """PDK_ROOT/PDK come from the resolved config, not the environment.
-
-        The step's command is built in a context where those environment
-        variables are not set (KeyError: 'PDK'); LibreLane carries them as
-        ordinary config variables instead. Environment is kept only as a
-        fallback.
-        """
-        try:
-            value = self.config[key]
-        except Exception:
-            value = None
-        return value or os.environ.get(key)
-
     def get_command(self):
-        pdk_root = self._lookup("PDK_ROOT")
-        pdk = self._lookup("PDK")
-        if not pdk_root or not pdk:
-            raise RuntimeError(
-                f"cannot locate the PDK: PDK_ROOT={pdk_root!r} PDK={pdk!r}"
-            )
-        lef = os.path.join(
-            str(pdk_root), str(pdk), self.config["SRAM_PDN_LEF_RELPATH"]
-        )
         return super().get_command() + [
-            "--lef", lef,
-            "--layer", self.config["SRAM_PDN_LAYER"],
             "--min-pairs", str(self.config["SRAM_PDN_MIN_PAIRS"]),
         ]
+
+
+# --- netgen writes IHP SRAM power pin names (VDD!, VSS!, VDDARRAY!) into its
+# LVS JSON with a stray backslash ("\VDD!"), which is not a valid JSON escape,
+# and librelane.steps.netgen.LVS then dies in json.loads before the LVS
+# checker runs.  Same monkeypatch as ihp-um-janestreet-prism.
+import json as _json
+import re as _re
+import types as _types
+
+import librelane.steps.netgen as _netgen
+
+_BAD_ESCAPE = _re.compile(r'\\(\\|[^"\\/bfnrtu])')
+
+
+def _repair_escapes(s):
+    return _BAD_ESCAPE.sub(
+        lambda m: '\\\\' if m.group(1) == '\\' else '\\\\' + m.group(1), s
+    )
+
+
+def _loads_repairing_escapes(s, *args, **kwargs):
+    try:
+        return _json.loads(s, *args, **kwargs)
+    except _json.JSONDecodeError:
+        return _json.loads(_repair_escapes(s), *args, **kwargs)
+
+
+_netgen.json = _types.SimpleNamespace(
+    loads=_loads_repairing_escapes,
+    load=_json.load,
+    dumps=_json.dumps,
+    dump=_json.dump,
+    JSONDecodeError=_json.JSONDecodeError,
+)

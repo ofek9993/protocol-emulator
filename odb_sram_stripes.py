@@ -1,387 +1,669 @@
-# Route the tile's Metal4 PDN through the IHP SRAM's legal supply columns.
+# Rewrite the tile Metal4 PDN over the IHP SRAM so its rails become the PDN.
 #
-# Why the obvious approach does not work
-# --------------------------------------
-# The macro declares only three Metal4 PINs (VDD!, VDDARRAY!, VSS!), and it
-# is tempting to simply draw a stripe on each declared pin rectangle. That
-# fails three ways at once, all of which this project hit:
+# Modeled on ihp-um-janestreet-prism/odb_stripes.py. The 1024x8 LEF only
+# declares three Metal4 PIN rectangles (VSS! / VDD! / VDDARRAY!), but the
+# Metal4 OBS leaves many repeating ~3.33 um corridors on a ~5.62 um pitch —
+# the same legal supply columns allocate_sram() selects on larger IHP SRAMs.
+# This step:
 #
-#   * the pins are not where metal is *allowed* - the Metal4 OBS blocks most
-#     of the face, and a stripe crossing an obstruction bar is an illegal
-#     overlap;
-#   * newly drawn stripes are electrically floating, because nothing
-#     connects them down to the standard-cell rails;
-#   * VDD! stops at y 38.825 while VDDARRAY! starts at 45.465, so a stripe
-#     spanning both crosses the obstruction bar sitting in that break.
-#
-# What actually works
-# -------------------
-# The Metal4 OBS leaves a regular lattice of narrow corridors - for this
-# macro, 24 of them, each exactly 3.33um wide, on a ~5.62um pitch. Those
-# corridors are the legal supply columns. Every corridor of this macro
-# contains exactly one declared pin, so each column's polarity is known
-# directly (verified against the PDK LEF; larger IHP SRAMs have more
-# corridors than pins and need polarity inferred by alternation instead).
-#
-# So rather than adding stripes, this step *relocates* them: the tile
-# stripes that already cross the macro footprint are removed and redrawn on
-# the nearest legal column, full core height, picking up Metal1<->Metal4 via
-# stacks where they cross standard-cell rails outside the macro. The via
-# masters are not constructed here - pdngen already built them for the
-# standard-cell grid, so they are looked up by name and reused.
-#
-# Not every column needs feeding: the macro distributes internally, so a
-# couple of VPWR/VGND pairs is enough.
-#
-# Method modelled on the approach used in WilliamZhang20/protocol-emulator
-# and ihp-um-janestreet-prism; implementation written for this project.
-import re
-
+#   1. Discovers those corridors from the master OBS + declared PINs, assigns
+#      VPWR/VGND polarity from the known pins and the 5.62 um alternation.
+#   2. Clusters them into array L / band / array R (wide OBS gaps).
+#   3. Runs PRISM allocate_sram(): map crossing tile stripes → nearest legal
+#      column, then complete VPWR/VGND pairs within each region.
+#   4. Removes every tile stripe through the footprint and draws full-height
+#      replacements on the chosen columns, with M1↔M4 rail vias outside the
+#      macro; tidy() leaves one full-height box + pin per stripe x.
 import click
-
-try:  # so the geometry helpers can be unit-tested without OpenROAD present
-    import odb
-    from reader import click_odb
-except ImportError:  # pragma: no cover
-    odb = None
-    click_odb = None
-
-PIN_TO_NET = {"VDD!": "VPWR", "VDDARRAY!": "VPWR", "VSS!": "VGND"}
-OTHER_NET = {"VPWR": "VGND", "VGND": "VPWR"}
-RAIL_VIA_PREFIXES = ("via1_2_2100_440", "via2_3_2100_440", "via3_4_2100_440")
-
-TALL_OBS_UM = 50.0      # an OBS rect taller than this defines a column edge
-MAX_CORRIDOR_UM = 4.0   # wider than this is a region break, not a supply slot
+import odb
+import os
+import re
+from reader import click_odb
 
 
-# --------------------------------------------------------------- LEF parsing
-def _pin_rects(text, name):
-    m = re.search(
-        r"^\s*PIN\s+" + re.escape(name) + r"\s*$(.*?)^\s*END\s+"
-        + re.escape(name) + r"\s*$",
-        text, re.S | re.M,
+SRAM_PINS = {
+    "VPWR": ("VDD!", "VDDARRAY!"),
+    "VGND": ("VSS!",),
+}
+
+# IHP SRAM Metal4 supply pitch between adjacent opposite-polarity columns.
+PAIR_PITCH_UM = 5.62
+MACRO_NAME = "RM_IHPSG13_1P_1024x8_c2_bm_bist"
+HERE = os.path.dirname(os.path.abspath(__file__))
+LEF_PATH = os.path.join(HERE, "macro", MACRO_NAME, f"{MACRO_NAME}.lef")
+
+
+def is_sram(master):
+    return (
+        master.findMTerm("VDD!") is not None
+        and master.findMTerm("VSS!") is not None
     )
-    if not m:
-        return []
-    return [
-        tuple(map(float, r))
-        for r in re.findall(
-            r"RECT\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*;",
-            m.group(1),
-        )
-    ]
 
 
-def _spans_whole(spans, height, tol=0.5):
-    """True only if the pin metal runs the macro's full height unbroken.
+def lef_tall_metal4_obs():
+    """Master-frame (x0, x1) for tall Metal4 OBS rects, from the LEF text.
 
-    VDD! and VDDARRAY! share x positions on 8 columns: VDD! stops at y
-    38.825 and VDDARRAY! resumes at 45.465, and the macro routes its own
-    metal through that break. Merging the two by min/max would hide the gap
-    and make such a column look full height, which is how a stripe ended up
-    crossing the break and shorting VPWR to VGND.
+    Parsing the LEF avoids depending on odb's getObstructions() polygon
+    decomposition across LibreLane / OpenROAD versions.
     """
-    if not spans:
-        return False
-    merged = []
-    for lo, hi in sorted(spans):
-        if merged and lo <= merged[-1][1] + tol:
-            merged[-1][1] = max(merged[-1][1], hi)
-        else:
-            merged.append([lo, hi])
-    return (len(merged) == 1
-            and merged[0][0] <= tol
-            and merged[0][1] >= height - tol)
+    if not os.path.isfile(LEF_PATH):
+        raise click.ClickException(f"SRAM LEF not found: {LEF_PATH}")
+    text = open(LEF_PATH, encoding="utf-8", errors="replace").read()
+    match = re.search(r"LAYER Metal4 SPACING.*?(?=\n\s*END)", text, re.S)
+    if match is None:
+        raise click.ClickException(f"{LEF_PATH}: no Metal4 OBS block")
+    tall = []
+    for r in re.findall(
+        r"RECT\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", match.group(0)
+    ):
+        x0, y0, x1, y1 = map(float, r)
+        if y1 - y0 > 50.0:
+            tall.append((x0, x1))
+    return sorted(set(tall))
 
 
-def legal_columns(lef_path, layer="Metal4"):
-    """Legal supply columns in the macro's own frame, in microns.
-
-    Returns [(x0, x1, net, full_height)] - the Metal4 OBS gaps, each tagged
-    with the net of the declared pin inside it and whether that pin spans the
-    whole macro (only those may carry a full-height stripe). Pin names end in '!', which is not a word
-    character, so pin blocks are matched on whole lines rather than with a
-    \\b anchor (a \\b after '!' can never match).
-    """
-    text = open(lef_path, encoding="utf-8", errors="replace").read()
-
-    size = re.search(r"SIZE\s+([\d.]+)\s+BY\s+([\d.]+)", text)
-    if size is None:
-        raise click.ClickException(f"{lef_path}: no SIZE line")
-    height = float(size.group(2))
-
-    # Keep each pin's y-extent: a column is only safe to drive full height if
-    # its pin runs the whole macro. VDD! stops at y 38.825 on 8 of its 12
-    # columns, with VDDARRAY! resuming at 45.465 - the macro routes its own
-    # metal through that break, so a stripe crossing it shorts VPWR to VGND.
-    polarity = {}
-    for pin_name, net in PIN_TO_NET.items():
-        for x0, y0, x1, y1 in _pin_rects(text, pin_name):
-            key = (round(x0, 3), round(x1, 3))
-            polarity.setdefault(key, (net, [], set()))[1].append((y0, y1))
-            polarity[key][2].add(pin_name)
-    if not polarity:
-        raise click.ClickException(
-            f"{lef_path}: no VDD!/VDDARRAY!/VSS! pins found - wrong LEF?"
-        )
-
-    obs = re.search(r"LAYER %s SPACING.*?(?=\n\s*END)" % layer, text, re.S)
-    if obs is None:
-        raise click.ClickException(f"{lef_path}: no {layer} OBS block")
-    bars = sorted({
-        (float(x0), float(x1))
-        for x0, y0, x1, y1 in re.findall(
-            r"RECT\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", obs.group(0))
-        if float(y1) - float(y0) > TALL_OBS_UM
-    })
-
-    columns = []
-    for (_a0, a1), (b0, _b1) in zip(bars, bars[1:]):
-        if b0 - a1 <= 0 or b0 - a1 > MAX_CORRIDOR_UM:
-            continue
-        inside = [
-            v for (p0, p1), v in polarity.items()
-            if p0 >= a1 - 0.01 and p1 <= b0 + 0.01
-        ]
-        if len(inside) == 1:
-            net, spans, pin_names = inside[0]
-            columns.append((round(a1, 3), round(b0, 3), net,
-                            _spans_whole(spans, height), frozenset(pin_names)))
-    if not columns:
-        raise click.ClickException(
-            f"{lef_path}: no legal {layer} corridors found between OBS bars"
-        )
-    return columns
-
-
-# ------------------------------------------------------------- odb helpers
-def _is_sram(master):
-    return (master.findMTerm("VDD!") is not None
-            and master.findMTerm("VSS!") is not None)
-
-
-def _vertical(boxes, layer_name):
-    out = []
-    for b in boxes:
-        tl = b.getTechLayer()
-        if tl is not None and tl.getName() == layer_name \
-                and (b.yMax() - b.yMin()) > (b.xMax() - b.xMin()):
-            out.append(b)
-    return out
-
-
-def _centre(x0, x1):
-    return (x0 + x1) // 2
-
-
-def allocate(columns_dbu, crossing_centres, min_pairs, pair_gap):
-    """Pick which legal columns to drive, per net.
-
-    Each tile stripe crossing the macro claims the nearest free column of
-    its own net; then each net is topped up until at least min_pairs
-    VPWR/VGND pairs sit close enough together to behave like a supply pair.
-    """
-    chosen = {"VPWR": [], "VGND": []}
-
-    for net in ("VPWR", "VGND"):
-        free = [c for c in columns_dbu if c[2] == net]
-        for tx in sorted(crossing_centres.get(net, [])):
-            avail = [c for c in free if c not in chosen[net]]
-            if not avail:
-                break
-            chosen[net].append(
-                min(avail, key=lambda c: abs(_centre(c[0], c[1]) - tx)))
-
-    def pair_count():
-        n = 0
-        for c in chosen["VPWR"]:
-            cx = _centre(c[0], c[1])
-            if any(abs(_centre(o[0], o[1]) - cx) <= pair_gap
-                   for o in chosen["VGND"]):
-                n += 1
-        return n
-
-    # Top up so each region of the macro is actually fed from both rails.
-    guard = 0
-    while pair_count() < min_pairs and guard < 64:
-        guard += 1
-        for net in ("VPWR", "VGND"):
-            avail = [c for c in columns_dbu
-                     if c[2] == net and c not in chosen[net]]
-            if not avail:
-                continue
-            anchors = chosen[OTHER_NET[net]] or chosen[net]
-            if anchors:
-                ax = _centre(anchors[0][0], anchors[0][1])
-                avail.sort(key=lambda c: abs(_centre(c[0], c[1]) - ax))
-            chosen[net].append(avail[0])
-    return chosen
-
-
-# ------------------------------------------------------------------- main
-def build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um=2.1,
-          min_clearance_um=0.21):
+@click.command()
+@click.option("--layer", default="Metal4", help="Vertical PDN layer")
+@click.option("--min-pairs", default=2, type=int,
+              help="Minimum VPWR/VGND column pairs per SRAM region "
+                   "(array L / band / array R); the macro's internal mesh "
+                   "carries whatever a region is not fed directly")
+@click_odb
+def extend(reader, layer, min_pairs):
     block = reader.block
-    dbu = block.getDefUnits()
-    m4 = reader.tech.findLayer(layer)
-    if m4 is None:
-        raise click.ClickException(f"tech layer {layer!r} not found")
+    tech = reader.tech
+    m = tech.findLayer(layer)
+    if m is None:
+        raise click.ClickException(f"tech layer {layer} not found")
     core = block.getCoreArea()
     ylo, yhi = core.yMin(), core.yMax()
-    pair_gap = int(pair_gap_um * dbu)
+    dbu = block.getDefUnits()
 
     rail_vias = []
-    for prefix in RAIL_VIA_PREFIXES:
-        hit = [v for v in block.getVias() if v.getName().startswith(prefix)]
-        if hit:
-            rail_vias.append(hit[0])
-    if not rail_vias:
-        raise click.ClickException(
-            "no pdngen rail via masters found (expected names starting "
-            + ", ".join(RAIL_VIA_PREFIXES)
-            + ") - the standard-cell grid should have created them"
+    for prefix in ("via1_2_2100_440", "via2_3_2100_440", "via3_4_2100_440"):
+        found = [v for v in block.getVias() if v.getName().startswith(prefix)]
+        if found:
+            rail_vias.append(found[0])
+
+    pin_xs = []
+    for bterm in block.getBTerms():
+        if bterm.getSigType() in ("POWER", "GROUND"):
+            continue
+        for bpin in bterm.getBPins():
+            for box in bpin.getBoxes():
+                pin_xs.append((box.xMin(), box.xMax()))
+
+    # Kept for allocate_sram / clear_of_rails parity (no CFGMEM here).
+    macro_rails = {"VPWR": [], "VGND": []}
+    for inst in block.getInsts():
+        master = inst.getMaster()
+        if not master.isBlock() or is_sram(master):
+            continue
+        ox = inst.getBBox().xMin()
+        for nn in ("VPWR", "VGND"):
+            mterm = master.findMTerm(nn)
+            if mterm is None:
+                continue
+            for mpin in mterm.getMPins():
+                for box in mpin.getGeometry():
+                    if (
+                        box.getTechLayer() is not None
+                        and box.getTechLayer().getName() == layer
+                    ):
+                        macro_rails[nn].append(
+                            (ox + box.xMin(), ox + box.xMax())
+                        )
+
+    clearance = int(0.24 * dbu)
+    pair_gap = int(6.5 * dbu)
+    pin_margin = int(0.5 * dbu)
+    pair_pitch = int(PAIR_PITCH_UM * dbu)
+    full_tol = int(1.0 * dbu)
+    # Corridor wider than this is a region break (wide OBS), not a pin slot.
+    max_corridor_um = 4.0
+    region_break_um = 8.0
+
+    def clear_of_rails(x0, x1, nn):
+        other = "VGND" if nn == "VPWR" else "VPWR"
+        return all(
+            x1 + clearance <= r0 or x0 - clearance >= r1
+            for (r0, r1) in macro_rails[other]
         )
-    click.echo(f"[sram-pdn] reusing {len(rail_vias)} pdngen via masters: "
-               + ", ".join(v.getName() for v in rail_vias))
 
-    srams = [i for i in block.getInsts()
-             if i.getMaster().isBlock() and _is_sram(i.getMaster())]
-    if not srams:
-        raise click.ClickException("no SRAM macro instance found in the design")
+    def clear_of_pins(x0, x1):
+        return all(
+            x1 + clearance <= px0 or x0 - clearance >= px1
+            for (px0, px1) in pin_xs
+        )
 
-    master_cols = legal_columns(lef, layer)
-    click.echo(
-        f"[sram-pdn] {len(master_cols)} legal {layer} columns in the LEF "
-        f"({sum(1 for c in master_cols if c[2]=='VPWR')} VPWR / "
-        f"{sum(1 for c in master_cols if c[2]=='VGND')} VGND); "
-        f"{sum(1 for c in master_cols if 'VDDARRAY!' in c[4])} carry VDDARRAY!")
+    def is_full(b):
+        return b.yMin() <= ylo + full_tol and b.yMax() >= yhi - full_tol
 
-    nets = {}
+    def xkey(b):
+        return int(((b.xMin() + b.xMax()) // 2) // (0.01 * dbu))
+
+    def vertical_m4(boxes):
+        return [
+            b for b in boxes
+            if b.getTechLayer() is not None
+            and b.getTechLayer().getName() == layer
+            and (b.yMax() - b.yMin()) > (b.xMax() - b.xMin())
+        ]
+
+    def centre(c):
+        return (c[0] + c[1]) // 2
+
+    def declared_pins(inst):
+        """Die-frame PIN rectangles, keyed by net polarity."""
+        master = inst.getMaster()
+        ox = inst.getBBox().xMin()
+        h = master.getHeight()
+        out = {
+            "VPWR": {"full": set(), "rest": set()},
+            "VGND": {"full": set(), "rest": set()},
+        }
+        for pin_name in ("VDD!", "VDDARRAY!", "VSS!"):
+            mterm = master.findMTerm(pin_name)
+            if mterm is None:
+                continue
+            nn = "VGND" if pin_name == "VSS!" else "VPWR"
+            for mpin in mterm.getMPins():
+                for box in mpin.getGeometry():
+                    if (
+                        box.getTechLayer() is None
+                        or box.getTechLayer().getName() != layer
+                    ):
+                        continue
+                    c = (ox + box.xMin(), ox + box.xMax())
+                    if box.yMax() - box.yMin() >= 0.9 * h:
+                        out[nn]["full"].add(c)
+                    else:
+                        out[nn]["rest"].add(c)
+        return out
+
+    def obs_corridors(inst):
+        """Die-frame (x0, x1) for each Metal4 OBS gap that looks like a pin
+        corridor (~pin width), plus the declared PIN boxes themselves."""
+        ox = inst.getBBox().xMin()
+        obs = lef_tall_metal4_obs()  # master um
+        # Declared pin width (fallback 2.81 um) for synthetic corridors.
+        pin_w_um = 2.81
+        for nn_pins in declared_pins(inst).values():
+            for c in nn_pins["full"] | nn_pins["rest"]:
+                pin_w_um = min(pin_w_um, (c[1] - c[0]) / dbu)
+        pin_w = int(pin_w_um * dbu)
+
+        corridors = set()
+        for i in range(len(obs) - 1):
+            g0_um, g1_um = obs[i][1], obs[i + 1][0]
+            if g1_um <= g0_um:
+                continue
+            width_um = g1_um - g0_um
+            if width_um <= 0 or width_um > max_corridor_um:
+                continue
+            g0, g1 = int(g0_um * dbu), int(g1_um * dbu)
+            cx = (g0 + g1) // 2
+            half = pin_w // 2
+            c0 = max(g0 + int(0.05 * dbu), cx - half)
+            c1 = min(g1 - int(0.05 * dbu), cx + half)
+            if c1 - c0 < int(1.0 * dbu):
+                c0, c1 = g0, g1
+            corridors.add((ox + c0, ox + c1))
+
+        for nn_pins in declared_pins(inst).values():
+            corridors |= nn_pins["full"] | nn_pins["rest"]
+        if len(corridors) < 6:
+            raise click.ClickException(
+                f"{inst.getName()}: only {len(corridors)} Metal4 corridors "
+                f"from OBS+PINs; expected the repeating ~5.62 um lattice"
+            )
+        return sorted(corridors)
+
+    def assign_polarity(inst, corridors):
+        """Label corridors VPWR/VGND from declared pins + alternation."""
+        pins = declared_pins(inst)
+        known = []  # (centre, net)
+        for c in pins["VGND"]["full"] | pins["VGND"]["rest"]:
+            known.append((centre(c), "VGND"))
+        for c in pins["VPWR"]["full"] | pins["VPWR"]["rest"]:
+            known.append((centre(c), "VPWR"))
+        if not known:
+            raise click.ClickException(
+                f"{inst.getName()}: no Metal4 power PINs to seed polarity"
+            )
+        known.sort()
+
+        def polarity_of(cx):
+            for kx, nn in known:
+                if abs(cx - kx) <= pin_margin:
+                    return nn
+            kx, base = min(known, key=lambda kn: abs(kn[0] - cx))
+            steps = int(round((cx - kx) / float(pair_pitch)))
+            if steps % 2 == 0:
+                return base
+            return "VGND" if base == "VPWR" else "VPWR"
+
+        cols = {"VPWR": {}, "VGND": {}}
+        for c in corridors:
+            nn = polarity_of(centre(c))
+            cols[nn][c] = None  # region filled below
+        return cols
+
+    def assign_regions(cols):
+        """Cluster corridors into array L / band / array R at wide gaps."""
+        all_c = sorted(
+            set(cols["VPWR"]) | set(cols["VGND"]), key=centre
+        )
+        if not all_c:
+            return cols
+        clusters = [[all_c[0]]]
+        for c in all_c[1:]:
+            if centre(c) - centre(clusters[-1][-1]) > region_break_um * dbu:
+                clusters.append([c])
+            else:
+                clusters[-1].append(c)
+        names = []
+        if len(clusters) == 1:
+            names = ["band"]
+        elif len(clusters) == 2:
+            names = ["array L", "array R"]
+        else:
+            # First / last are arrays; everything in between is the band
+            # (matches the three OBS-separated regions of the 1024x8).
+            names = (
+                ["array L"]
+                + ["band"] * (len(clusters) - 2)
+                + ["array R"]
+            )
+        region_of = {}
+        for name, cluster in zip(names, clusters):
+            for c in cluster:
+                region_of[c] = name
+        for nn in cols:
+            cols[nn] = {c: region_of[c] for c in cols[nn]}
+        return cols
+
+    # Legal columns per instance (die frame), for on_sram_column / allocate.
+    sram_cols = {"VPWR": [], "VGND": []}
+    sram_boxes = []
+    sram_legal = {}  # inst name → cols dict with regions
+
+    for inst in block.getInsts():
+        master = inst.getMaster()
+        if not master.isBlock() or not is_sram(master):
+            continue
+        ib = inst.getBBox()
+        sram_boxes.append((ib.xMin(), ib.xMax()))
+        corridors = obs_corridors(inst)
+        cols = assign_regions(assign_polarity(inst, corridors))
+        sram_legal[inst.getName()] = cols
+        for nn in ("VPWR", "VGND"):
+            sram_cols[nn].extend(cols[nn].keys())
+    for nn in sram_cols:
+        sram_cols[nn] = sorted(set(sram_cols[nn]))
+
+    def on_sram_column(x0, x1, nn):
+        for sx0, sx1 in sram_boxes:
+            if x1 <= sx0 or x0 >= sx1:
+                continue
+            if not any(
+                c0 - 0.02 * dbu <= x0 and x1 <= c1 + 0.02 * dbu
+                for (c0, c1) in sram_cols[nn]
+            ):
+                return False
+        return True
+
+    def tidy(net_name, swire, bpin, rails):
+        boxes = vertical_m4(swire.getWires())
+        vias = [b for b in swire.getWires() if b.getTechLayer() is None]
+        pboxes = []
+        if bpin is not None:
+            pboxes = [
+                p for p in bpin.getBoxes()
+                if p.getTechLayer() is not None
+                and p.getTechLayer().getName() == layer
+                and (p.yMax() - p.yMin()) > (p.xMax() - p.xMin())
+            ]
+        groups, pgroups = {}, {}
+        for b in boxes:
+            groups.setdefault(xkey(b), []).append(b)
+        for p in pboxes:
+            pgroups.setdefault(xkey(p), []).append(p)
+        dropped = extended = pins_dropped = orphans = 0
+        for k, sb in sorted(groups.items()):
+            x0 = min(b.xMin() for b in sb)
+            x1 = max(b.xMax() for b in sb)
+            cx = (x0 + x1) // 2
+            full = [b for b in sb if is_full(b)]
+            if full:
+                keep = max(full, key=lambda b: b.yMax() - b.yMin())
+                for b in sb:
+                    if b is not keep:
+                        odb.dbSBox_destroy(b)
+                        dropped += 1
+            else:
+                if not (
+                    on_sram_column(x0, x1, net_name)
+                    and clear_of_rails(x0, x1, net_name)
+                    and clear_of_pins(x0, x1)
+                ):
+                    print(
+                        f"[WARNING] {net_name}: partial-height stripe at "
+                        f"x={cx/dbu:.2f} um blocked from full height"
+                    )
+                    continue
+                for b in sb:
+                    odb.dbSBox_destroy(b)
+                keep = odb.dbSBox_create(swire, m, x0, ylo, x1, yhi, "STRIPE")
+                have = [
+                    (v.yMin() + v.yMax()) // 2 for v in vias
+                    if abs((v.xMin() + v.xMax()) // 2 - cx) < 0.5 * dbu
+                ]
+                new_vias = 0
+                for r in rails:
+                    if r.xMin() <= cx <= r.xMax():
+                        ry = (r.yMin() + r.yMax()) // 2
+                        if not any(abs(h - ry) < 0.3 * dbu for h in have):
+                            for via in rail_vias:
+                                odb.dbSBox_create(swire, via, cx, ry, "STRIPE")
+                            new_vias += 1
+                extended += 1
+                print(
+                    f"[INFO] {net_name}: {len(sb)} partial-height segments at "
+                    f"x={cx/dbu:.2f} um → one full-height stripe "
+                    f"(+{new_vias} rail via stacks)"
+                )
+            if bpin is not None:
+                for p in pgroups.pop(k, []):
+                    odb.dbBox_destroy(p)
+                    pins_dropped += 1
+                odb.dbBox_create(
+                    bpin, m, keep.xMin(), keep.yMin(), keep.xMax(), keep.yMax()
+                )
+                pins_dropped -= 1
+        for _k, ps in pgroups.items():
+            for p in ps:
+                odb.dbBox_destroy(p)
+                orphans += 1
+        print(
+            f"[INFO] {net_name}: tidy: dropped {dropped} redundant segments, "
+            f"extended {extended}, dropped {pins_dropped} duplicate / "
+            f"{orphans} orphan pin boxes; {len(groups)} stripes remain"
+        )
+
+    def allocate_sram(inst, grid):
+        """PRISM allocate_sram: map grid → columns, complete pairs, seed pins.
+
+        Columns come from OBS corridors + declared PINs (see obs_corridors),
+        not from the three top-level PIN rectangles alone.
+        """
+        cols = sram_legal[inst.getName()]
+        ib = inst.getBBox()
+        regions = [
+            r for r in ("array L", "band", "array R")
+            if r in set(cols["VPWR"].values()) | set(cols["VGND"].values())
+        ]
+        chosen = {"VPWR": [], "VGND": []}
+        other_of = {"VPWR": "VGND", "VGND": "VPWR"}
+
+        def clear(c, nn):
+            return (
+                clear_of_pins(c[0], c[1])
+                and clear_of_rails(c[0], c[1], nn)
+            )
+
+        def free(nn, region=None):
+            return [
+                c for c, r in cols[nn].items()
+                if c not in chosen[nn]
+                and (region is None or r == region)
+                and clear(c, nn)
+            ]
+
+        def partnered(c, nn):
+            return any(
+                abs(centre(o) - centre(c)) <= pair_gap
+                for o in chosen[other_of[nn]]
+            )
+
+        def pairs(r):
+            return sum(
+                1 for c in chosen["VPWR"]
+                if cols["VPWR"].get(c) == r and partnered(c, "VPWR")
+            )
+
+        def where(c):
+            r = cols["VPWR"].get(c) or cols["VGND"].get(c)
+            return f"x={centre(c)/dbu:.2f} um ({r})"
+
+        # 1. every tile stripe crossing the footprint → nearest free column
+        n_grid = {}
+        for nn in ("VPWR", "VGND"):
+            targets = sorted(set(
+                centre((b.xMin(), b.xMax())) for b in grid[nn]
+                if b.xMax() > ib.xMin() and b.xMin() < ib.xMax()
+            ))
+            n_grid[nn] = len(targets)
+            for tx in targets:
+                cands = free(nn)
+                if not cands:
+                    print(
+                        f"[WARNING] {inst.getName()}: no free {nn} column "
+                        f"for the stripe at x={tx/dbu:.2f}"
+                    )
+                    continue
+                c = min(cands, key=lambda c: abs(centre(c) - tx))
+                chosen[nn].append(c)
+                shift = (centre(c) - tx) / dbu
+                if abs(shift) > 0.05:
+                    print(
+                        f"[INFO] {inst.getName()}: {nn} stripe at "
+                        f"x={tx/dbu:.2f} moved {shift:+.2f} um onto a column"
+                    )
+
+        # 1b. keep the named LEF PIN columns (abstract LVS hooks)
+        pins = declared_pins(inst)
+        for nn, bucket in (
+            ("VGND", pins["VGND"]),
+            ("VPWR", pins["VPWR"]),
+        ):
+            for c in bucket["full"] | bucket["rest"]:
+                if c in cols[nn] and c not in chosen[nn] and clear(c, nn):
+                    chosen[nn].append(c)
+                    print(
+                        f"[INFO] {inst.getName()}: kept declared {nn} PIN "
+                        f"column at {where(c)}"
+                    )
+
+        # 2. pair completion inside each region
+        def complete_pairs():
+            for nn in ("VPWR", "VGND"):
+                other = other_of[nn]
+                for c in list(chosen[nn]):
+                    if partnered(c, nn):
+                        continue
+                    r = cols[nn][c]
+                    cands = free(other, r)
+                    if not cands:
+                        print(
+                            f"[WARNING] {inst.getName()}: no free {other} "
+                            f"column in the {r} to pair with the {nn} stripe "
+                            f"at {where(c)}"
+                        )
+                        continue
+                    same = [
+                        centre(e) for e in chosen[other]
+                        if cols[other][e] == r
+                    ]
+                    o = min(
+                        cands,
+                        key=lambda o: (
+                            abs(centre(o) - centre(c)),
+                            -min(
+                                (abs(centre(o) - x) for x in same),
+                                default=0,
+                            ),
+                        ),
+                    )
+                    chosen[other].append(o)
+                    print(
+                        f"[INFO] {inst.getName()}: {other} stripe added at "
+                        f"{where(o)} to pair with the {nn} stripe at "
+                        f"{where(c)}"
+                    )
+
+        complete_pairs()
+
+        # 3. every populated region gets at least --min-pairs pairs: one
+        #    contact per region leaves the far end of an array fed only
+        #    through the macro's internal mesh
+        for r in regions:
+            need = min_pairs
+            while pairs(r) < need:
+                cands = free("VPWR", r)
+                if not cands:
+                    print(
+                        f"[WARNING] {inst.getName()}: the {r} has only "
+                        f"{pairs(r)} VPWR/VGND pair(s) and no free VPWR "
+                        f"column"
+                    )
+                    break
+                have = [
+                    centre(c) for c in chosen["VPWR"]
+                    if cols["VPWR"][c] == r
+                ]
+                c = max(
+                    cands,
+                    key=lambda c: (
+                        min((abs(centre(c) - x) for x in have), default=0),
+                        -centre(c),
+                    ),
+                )
+                chosen["VPWR"].append(c)
+                print(
+                    f"[INFO] {inst.getName()}: VPWR stripe added at "
+                    f"{where(c)} so the {r} reaches {need} pair(s)"
+                )
+                complete_pairs()
+
+        print(
+            f"[INFO] {inst.getName()}: "
+            + ", ".join(f"{r}: {pairs(r)} pairs" for r in regions)
+            + f"; VPWR {len(chosen['VPWR'])} / VGND {len(chosen['VGND'])} "
+            f"stripes for the {n_grid['VPWR']} / {n_grid['VGND']} tile "
+            f"stripes crossing the macro"
+        )
+        return {nn: sorted(chosen[nn]) for nn in chosen}
+
+    # Decide allocation before mutating geometry.
+    grid = {}
     for net_name in ("VPWR", "VGND"):
         net = block.findNet(net_name)
         if net is None:
-            raise click.ClickException(f"net {net_name!r} not found")
+            raise click.ClickException(f"net {net_name} not found")
+        grid[net_name] = vertical_m4(
+            [b for sw in net.getSWires() for b in sw.getWires()]
+        )
+    sram_alloc = {}
+    for inst in block.getInsts():
+        if inst.getMaster().isBlock() and is_sram(inst.getMaster()):
+            if inst.getOrient() not in ("R0", "MX"):
+                raise click.ClickException(
+                    f"{inst.getName()} orientation {inst.getOrient()} "
+                    "unsupported (need R0 or MX)"
+                )
+            sram_alloc[inst.getName()] = allocate_sram(inst, grid)
+
+    for net_name in ("VPWR", "VGND"):
+        net = block.findNet(net_name)
         swires = list(net.getSWires())
-        if not swires:
-            raise click.ClickException(f"net {net_name!r} has no special wires")
-        nets[net_name] = (net, swires[0])
-
-    for inst in srams:
-        ib = inst.getBBox()
-        ox = ib.xMin()
-        # Every column is usable. Filtering out the ones whose VDD! stops at
-        # y 38.825 looked safe but starved the macro: VDDARRAY!, which feeds
-        # the bit-cell array, exists ONLY on those columns, and dropping them
-        # left "[PSM-0039] Unconnected instance mem.sram/VDDARRAY!". A stripe
-        # there does cross the obstruction bar in the break, which Magic
-        # reports as an illegal overlap, but the bar is a keep-out in the LEF
-        # abstract rather than conflicting metal in the real GDS.
-        cols_dbu = [
-            (ox + int(round(x0 * dbu)), ox + int(round(x1 * dbu)), net)
-            for x0, x1, net, _full, _pins in master_cols
+        swire = swires[0] if swires else odb.dbSWire_create(net, "ROUTED")
+        stripes = vertical_m4(swire.getWires())
+        rails = [
+            b for b in swire.getWires()
+            if b.getTechLayer() is not None
+            and b.getTechLayer().getName() == "Metal1"
+            and (b.xMax() - b.xMin()) > (b.yMax() - b.yMin())
         ]
-        vddarray_x = {
-            ox + int(round((x0 + x1) / 2 * dbu))
-            for x0, x1, _n, _f, pins in master_cols if "VDDARRAY!" in pins
-        }
+        bpin = None
+        for bterm in net.getBTerms():
+            pins = list(bterm.getBPins())
+            if pins:
+                bpin = pins[0]
+                break
 
-        crossing_centres = {}
-        crossing_boxes = {}
-        for net_name, (_net, swire) in nets.items():
-            boxes = [
-                b for b in _vertical(swire.getWires(), layer)
-                if b.xMax() > ib.xMin() and b.xMin() < ib.xMax()
+        added = 0
+        for inst in block.getInsts():
+            master = inst.getMaster()
+            if not master.isBlock() or not is_sram(master):
+                continue
+            ib = inst.getBBox()
+            x0, x1 = ib.xMin(), ib.xMax()
+            columns = sram_alloc[inst.getName()][net_name]
+            if not columns:
+                print(
+                    f"[WARNING] {inst.getName()}: no {net_name} columns on "
+                    f"{layer}"
+                )
+                continue
+
+            crossing = [
+                b for b in stripes if b.xMax() > x0 and b.xMin() < x1
             ]
-            crossing_boxes[net_name] = boxes
-            crossing_centres[net_name] = sorted(
-                {_centre(b.xMin(), b.xMax()) for b in boxes})
+            removed_x = [(b.xMin(), b.xMax()) for b in crossing]
 
-        chosen = allocate(cols_dbu, crossing_centres, min_pairs, pair_gap)
-
-        # VDDARRAY! is a separate supply inside the macro; make sure at least
-        # one chosen column actually carries it.
-        if vddarray_x and not any(
-                _centre(c[0], c[1]) in vddarray_x for c in chosen["VPWR"]):
-            extra = next(
-                (c for c in cols_dbu
-                 if c[2] == "VPWR" and _centre(c[0], c[1]) in vddarray_x
-                 and c not in chosen["VPWR"]), None)
-            if extra is not None:
-                chosen["VPWR"].append(extra)
-                click.echo(
-                    f"[sram-pdn] added a VDDARRAY! column at "
-                    f"x={_centre(extra[0], extra[1])/dbu:.2f}um so the "
-                    "bit-cell array supply is driven"
+            def on_removed(box, removed_x=removed_x):
+                return any(
+                    box.xMax() > rx0 and box.xMin() < rx1
+                    for (rx0, rx1) in removed_x
                 )
 
-        for net_name, (_net, swire) in nets.items():
-            rails = [
-                b for b in swire.getWires()
-                if b.getTechLayer() is not None
-                and b.getTechLayer().getName() == "Metal1"
-            ]
             removed = 0
-            for b in crossing_boxes[net_name]:
+            for b in crossing:
                 odb.dbSBox_destroy(b)
                 removed += 1
+            if bpin is not None:
+                for box in list(bpin.getBoxes()):
+                    if (
+                        box.getTechLayer() is not None
+                        and box.getTechLayer().getName() == layer
+                        and on_removed(box)
+                    ):
+                        odb.dbBox_destroy(box)
+            for b in list(swire.getWires()):
+                if b.getTechLayer() is None and on_removed(b):
+                    odb.dbSBox_destroy(b)
+            stripes = [b for b in stripes if b not in crossing]
 
-            placed = vias = 0
-            for x0, x1, _net in chosen[net_name]:
-                # Centre a stripe of the grid's own width inside the corridor
-                # rather than filling it. The corridor is 3.33um wide and the
-                # macro's internal metal sits immediately either side of it,
-                # alternating VPWR/VGND - filling it edge to edge leaves no
-                # clearance and shorts the two together, which is what LVS
-                # caught. The LEF's own rule is "LAYER Metal4 SPACING 0.21".
-                cx = _centre(x0, x1)
-                half = min(int(stripe_width_um * dbu) // 2,
-                           (x1 - x0) // 2 - int(min_clearance_um * dbu))
-                if half <= 0:
-                    raise click.ClickException(
-                        f"corridor at x={cx/dbu:.2f}um is too narrow for a "
-                        f"stripe with {min_clearance_um}um clearance"
-                    )
-                odb.dbSBox_create(swire, m4, cx - half, ylo, cx + half, yhi,
-                                  "STRIPE")
-                placed += 1
+            for c0, c1 in columns:
+                stripes.append(
+                    odb.dbSBox_create(swire, m, c0, ylo, c1, yhi, "STRIPE")
+                )
+                if bpin is not None:
+                    odb.dbBox_create(bpin, m, c0, ylo, c1, yhi)
+                added += 1
+                cx = (c0 + c1) // 2
                 for r in rails:
-                    # only outside the macro: no cell rows run underneath it
                     if r.xMin() <= cx <= r.xMax() and (
-                            r.yMax() <= ib.yMin() or r.yMin() >= ib.yMax()):
-                        ry = _centre(r.yMin(), r.yMax())
+                        r.yMax() <= ib.yMin() or r.yMin() >= ib.yMax()
+                    ):
+                        ry = (r.yMin() + r.yMax()) // 2
                         for via in rail_vias:
                             odb.dbSBox_create(swire, via, cx, ry, "STRIPE")
-                        vias += 1
-            click.echo(
-                f"[sram-pdn] {inst.getName()} {net_name}: removed {removed} "
-                f"crossing tile stripe(s), placed {placed} column stripe(s) "
-                f"of width {stripe_width_um}um (corridors are "
-                f"{(chosen[net_name][0][1]-chosen[net_name][0][0])/dbu:.2f}um) "
-                f"at x=" + ", ".join(
-                    f"{_centre(c[0], c[1])/dbu:.2f}" for c in chosen[net_name])
-                + f" um, {vias} rail via stack(s)"
+            print(
+                f"[INFO] {inst.getName()}: {net_name}: removed {removed} "
+                f"crossing tile stripes; placed {len(columns)} "
+                f"full-height column stripe(s) "
+                f"({len(rail_vias)} via masters per rail crossing)"
             )
 
-
-def _cli():
-    """Built lazily so the geometry helpers stay importable without OpenROAD."""
-    @click.command()
-    @click.option("--lef", required=True, help="Path to the SRAM macro LEF")
-    @click.option("--layer", default="Metal4", help="Vertical PDN layer")
-    @click.option("--min-pairs", default=2, type=int,
-                  help="Minimum VPWR/VGND column pairs to drive per macro; "
-                       "the macro's internal mesh carries the rest")
-    @click.option("--pair-gap-um", default=6.5, type=float,
-                  help="Max centre spacing for two columns to count as a pair")
-    @click.option("--stripe-width-um", default=2.1, type=float,
-                  help="Stripe width, centred in the corridor. Must leave "
-                       "clearance to the macro's internal metal either side")
-    @click_odb
-    def run(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um):
-        build(reader, lef, layer, min_pairs, pair_gap_um, stripe_width_um)
-
-    return run
+        print(
+            f"[INFO] {net_name}: kept "
+            f"{len(vertical_m4(swire.getWires())) - added} non-SRAM stripes, "
+            f"added {added} SRAM-column stripe(s)"
+        )
+        tidy(net_name, swire, bpin, rails)
 
 
 if __name__ == "__main__":
-    _cli()()
+    extend()
