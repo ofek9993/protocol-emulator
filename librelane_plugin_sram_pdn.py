@@ -62,10 +62,30 @@ class ExtendSramPowerStripes(OdbpyStep):
     def get_script_path(self):
         return os.path.join(HERE, "odb_sram_stripes.py")
 
+    def _lookup(self, key):
+        """PDK_ROOT/PDK come from the resolved config, not the environment.
+
+        The step's command is built in a context where those environment
+        variables are not set (KeyError: 'PDK'); LibreLane carries them as
+        ordinary config variables instead. Environment is kept only as a
+        fallback.
+        """
+        try:
+            value = self.config[key]
+        except Exception:
+            value = None
+        return value or os.environ.get(key)
+
     def get_command(self):
-        pdk_root = os.environ["PDK_ROOT"]
-        pdk = os.environ["PDK"]
-        lef = os.path.join(pdk_root, pdk, self.config["SRAM_PDN_LEF_RELPATH"])
+        pdk_root = self._lookup("PDK_ROOT")
+        pdk = self._lookup("PDK")
+        if not pdk_root or not pdk:
+            raise RuntimeError(
+                f"cannot locate the PDK: PDK_ROOT={pdk_root!r} PDK={pdk!r}"
+            )
+        lef = os.path.join(
+            str(pdk_root), str(pdk), self.config["SRAM_PDN_LEF_RELPATH"]
+        )
         return super().get_command() + [
             "--instance", self.config["SRAM_PDN_INSTANCE"],
             "--lef", lef,
