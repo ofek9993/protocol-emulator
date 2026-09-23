@@ -290,7 +290,10 @@ module pemu_core (
         .state(c_state), .entering_o(c_entering), .timed_out(c_timed_out), .cmp(c_cmp), .cnt_o(c_cnt)
     );
 
-    // the controller's actions, turned into datapath and FIFO operations
+    // the controller's actions, turned into datapath and FIFO operations.
+    // Its own loop variable: an integer shared by two always blocks is ONE
+    // signal with two drivers to synthesis (Yosys: 32 conflicting drivers).
+    integer m;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             c_run <= 1'b0; c_go <= 1'b0; c_done <= 1'b0; c_under <= 1'b0; c_over <= 1'b0;
@@ -300,7 +303,7 @@ module pemu_core (
             stop_ovr_en <= 1'b0; stop_ovr_val <= 1'b1; frame_pend <= 1'b1;
             htx_n <= 3'd0; htx_rd <= 2'd0; htx_wr <= 2'd0;
             hrx_n <= 3'd0; hrx_rd <= 2'd0; hrx_wr <= 2'd0;
-            for (n = 0; n < 4; n = n + 1) cp_map[n] <= 6'd0;
+            for (m = 0; m < 4; m = m + 1) cp_map[m] <= 6'd0;
         end else begin
             c_go <= 1'b0; c_we <= {NS{1'b0}}; c_trig <= 1'b0; c_release <= 1'b0;
 
