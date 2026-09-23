@@ -1,0 +1,5 @@
+# Keep LF line endings in the repo: CI and the TT flow run on Linux.
+* text=auto eol=lf
+*.gds binary
+*.pdf binary
+*.png binary

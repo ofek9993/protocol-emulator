@@ -20,3 +20,26 @@ sim.sh
 test/sdf_annotate.vh
 WORKFLOW.md
 report.py
+AGENTS.md
+RESEARCH_FINDINGS.md
+DECISION.md
+ARCH_PIPELINE.md
+*.vvp
+STATUS_REPORT.md
+regress.sh
+
+# Python bytecode
+__pycache__/
+*.pyc
+# cocotb outputs
+test/output/
+
+# Local-only design notes, model and extra test tooling (not part of the TT submission)
+ARCHITECTURE.md
+AUDIT.md
+BUILD_LOG.md
+model/
+test/unit/
+test/structural_check.py
+test/trace_tool.py
+test/viz/
