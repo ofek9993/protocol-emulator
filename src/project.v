@@ -5,65 +5,64 @@
 
 `default_nettype none
 
-// SRAM scratchpad - workstation bring-up for the IHP hard macro.
+// Protocol emulator - Jane Street ASIC competition entry.
 //
-// Purpose is to prove the full flow works with a hard macro in it, not to be
-// the final protocol emulator. Three pieces:
+// Three layers (see ARCHITECTURE.md):
+//   * a programmable state-map CONTROLLER (pemu_ctrl.v): the host loads a
+//     state table - the protocol - and the controller runs it alone:
+//     chip-select, START/STOP, ACK checks, retries, timeouts;
+//   * a DATAPATH of 2 timers + 2 shifters wired by configuration, after
+//     NXP's FlexIO (AN5034 UART, AN5133 I2C, AN12780 SPI) - bits at a
+//     steady rate;
+//   * a PIN LAYER (pemu_pins.v): synchronisers, glitch filter, registered
+//     outputs, safe reset levels.
+// UART, SPI and I2C are tables plus register values, not fixed logic.
 //
-//   sram_wrapper   the 1024x8 IHP SRAM macro (a pre-built block)
-//   write_pointer  auto-incrementing write address (ordinary flops)
-//   this file      pin mapping and the read/write mux
+//   ui_in[0]     CFG_SCK   config shift clock
+//   ui_in[1]     CFG_SDI   config data in, MSB first
+//   ui_in[2]     CFG_CS    low while shifting, rising edge commits
+//   ui_in[6:3]   protocol inputs   (logical pins 8..11; UART RX = ui_in[3])
+//   uio[7:0]     protocol pins     (logical pins 0..7, in / out / open-drain)
+//   uo_out[0]    CFG_SDO   config read-back
+//   uo_out[1]    READY     the controller has finished
+//   uo_out[7:4]  protocol outputs  (logical pins 12..15; UART TX = uo_out[4])
 //
-// Writes are streamed: assert we and the data lands at the next free address,
-// pointer auto-increments. Reads are random-access from the address on uio.
-// Reads and writes share one SRAM port, so writing wins when both are asked.
-//
-//   ui_in [7:0]  write data
-//   uio_in[0]    write enable        (stores ui_in, advances the pointer)
-//   uio_in[1]    clear write pointer (rewind to address 0)
-//   uio_in[7:2]  read address, 6 bits -> the low 64 words
-//   uo_out[7:0]  data read back
+// A config write is 16 bits: {addr[7:0], data[7:0]}.
 module tt_um_ofek9993_protoemu (
-    input  wire [7:0] ui_in,    // Dedicated inputs  - write data
-    output wire [7:0] uo_out,   // Dedicated outputs - SRAM read data
-    input  wire [7:0] uio_in,   // IOs: Input path   - control + read address
-    output wire [7:0] uio_out,  // IOs: Output path  - unused
-    output wire [7:0] uio_oe,   // IOs: Enable path  - all inputs
+    input  wire [7:0] ui_in,    // Dedicated inputs  - config port + protocol inputs
+    output wire [7:0] uo_out,   // Dedicated outputs - SDO, READY, protocol outputs
+    input  wire [7:0] uio_in,   // IOs: Input path   - protocol pins
+    output wire [7:0] uio_out,  // IOs: Output path  - protocol pins
+    output wire [7:0] uio_oe,   // IOs: Enable path  - per-pin drive
     input  wire       ena,      // always 1 when the design is powered
     input  wire       clk,      // clock
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  wire       we        = uio_in[0];
-  wire       clear_ptr = uio_in[1];
-  wire [5:0] rd_addr   = uio_in[7:2];
+  // Reset synchroniser: reset ASSERTS immediately (asynchronously), but is
+  // RELEASED only on a clock edge, two flops after rst_n goes high. rst_n
+  // comes from outside the chip at an arbitrary moment; released raw, flops
+  // could leave reset on different clock edges and start out of step.
+  reg [1:0] rst_sync;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) rst_sync <= 2'b00;
+    else        rst_sync <= {rst_sync[0], 1'b1};
+  end
+  wire rst_n_sync = rst_sync[1];
 
-  wire [9:0] wr_addr;
-
-  write_pointer #(.WIDTH(10)) wptr (
-      .clk   (clk),
-      .rst_n (rst_n),
-      .clear (clear_ptr),
-      .step  (we),          // advance only on an actual write
-      .addr  (wr_addr)
+  pemu_core core (
+      .clk     (clk),
+      .rst_n   (rst_n_sync),
+      .ui_in   (ui_in),
+      .uo_out  (uo_out),
+      .uio_in  (uio_in),
+      .uio_out (uio_out),
+      .uio_oe  (uio_oe)
   );
-
-  // One port, so the write address wins while we is asserted.
-  wire [9:0] addr = we ? wr_addr : {4'b0, rd_addr};
-
-  sram_wrapper mem (
-      .clk  (clk),
-      .en   (1'b1),         // memory always enabled
-      .we   (we),
-      .addr (addr),
-      .din  (ui_in),
-      .dout (uo_out)
-  );
-
-  assign uio_out = 8'h00;
-  assign uio_oe  = 8'h00;   // uio is input-only here
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, 1'b0};
 
 endmodule
+
+`default_nettype wire
