@@ -168,3 +168,273 @@ async def test_uart_rx(dut):
         await chip.uart_send(sent)
         got = await chip.read(OUT_RDATA1)
         assert got == sent, f"UART RX: sent {sent:#04x}, read back {got:#04x}"
+
+
+# ======================================================================
+# The controller, through its real pins: SPI and I2C run as loaded tables
+# ======================================================================
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CCTL, HTX, HRXPOP, CSEL, PHOLD = 0x02, 0x03, 0x04, 0x05, 0x06
+CPMAP0, CPMAP1 = 0x08, 0x09
+OUT_HRX = 8
+
+
+def program(name):
+    """The state table exactly as the chip loads it: one {addr, data} word per line
+    (written by model/export_programs.py, identical to the RTL benches' copy)."""
+    with open(os.path.join(HERE, "prog_%s.hex" % name)) as f:
+        return [(int(l, 16) >> 8, int(l, 16) & 0xFF) for l in f if l.strip()]
+
+
+class Board:
+    """The wires outside the chip. Every clock: each uio wire is the AND of
+    what the chip drives (only where uio_oe = 1) and what the device drives,
+    with a pull-up where nobody drives - which is exactly how open drain works.
+    The device model sees the wires and may change what it drives."""
+
+    def __init__(self, dut, device):
+        self.dut, self.device = dut, device
+        self.en, self.val = 0, 0xFF          # what the device drives (per bit)
+        self.pad = 0xFF
+        cocotb.start_soon(self._run())
+
+    def _levels(self):
+        oe, out = self.dut.uio_oe.value, self.dut.uio_out.value
+        oe = int(oe) if oe.is_resolvable else 0
+        out = int(out) if out.is_resolvable else 0xFF
+        chip = (out & oe) | (~oe & 0xFF)     # released pads read high
+        dev = (self.val & self.en) | (~self.en & 0xFF)
+        return chip & dev
+
+    def drive(self, bit, level):             # device side: None = release
+        if level is None:
+            self.en &= ~(1 << bit)
+        else:
+            self.en |= 1 << bit
+            self.val = (self.val & ~(1 << bit)) | (level << bit)
+
+    async def _run(self):
+        while True:
+            await FallingEdge(self.dut.clk)
+            self.pad = self._levels()
+            self.device.step(self, self.pad)
+            self.dut.uio_in.value = self._levels()
+
+
+class SpiFlash:
+    """SPI mode 0 on CS uio[0], MOSI uio[1], MISO uio[2], SCK uio[3].
+    Answers 0x9F (READ JEDEC ID) with EF 40 18."""
+
+    def __init__(self):
+        self.pcs, self.psck, self.act, self.started = 1, 0, False, False
+        self.rx, self.sh, self.k, self.j, self.out = [], 0, 0, 0, 0xFF
+        self.clocks_without_cs = 0
+
+    def step(self, b, pad):
+        cs, mosi, sck = pad & 1, (pad >> 1) & 1, (pad >> 3) & 1
+        if not self.started:                                        # the first look is the starting point
+            self.pcs, self.psck, self.started = cs, sck, True
+            return
+        if self.pcs and not cs:
+            self.act, self.k, self.j, self.sh, self.out = True, 0, 0, 0, 0xFF
+            b.drive(2, self.out >> 7)
+        elif not self.pcs and cs:
+            self.act = False
+            b.drive(2, None)
+        if not self.psck and sck:                                   # rise: sample MOSI
+            if not self.act:
+                self.clocks_without_cs += 1
+            else:
+                self.sh = ((self.sh << 1) | mosi) & 0xFF
+                self.k += 1
+                if self.k == 8:
+                    self.rx.append(self.sh)
+                    n = len(self.rx) - 1
+                    self.out = [0xEF, 0x40, 0x18][n] if self.rx[0] == 0x9F and n < 3 else 0xFF
+                    self.k, self.sh = 0, 0
+        if self.psck and not sck and self.act:                      # fall: next MISO bit
+            self.j = (self.j + 1) % 8
+            b.drive(2, (self.out >> (7 - self.j)) & 1)
+        self.pcs, self.psck = cs, sck
+
+
+class I2cEeprom:
+    """A spec-behaved I2C EEPROM at 0x50 on SCL uio[2], SDA uio[3] (open drain):
+    detects START / STOP, ACKs its address, takes a register pointer, stores
+    written bytes, returns data, honours the master's ACK / NACK."""
+
+    def __init__(self):
+        self.mem = [0xFF] * 256
+        self.mode, self.bits, self.sh, self.rw, self.first = "idle", 0, 0, 0, False
+        self.ptr, self.cur, self.j, self.mack = 0, 0, 0, 1
+        self.ps, self.pd = 1, 1
+        self.starts = self.stops = 0
+        self.master_acks = []
+
+    def step(self, b, pad):
+        scl, sda = (pad >> 2) & 1, (pad >> 3) & 1
+
+        def sda_out(v):                                             # 1 = release, 0 = pull low
+            b.drive(3, None if v else 0)
+
+        if self.ps and scl:                                         # SDA moving while SCL high
+            if self.pd and not sda:
+                self.starts += 1
+                self.mode, self.bits, self.sh = "addr", 0, 0
+                sda_out(1)
+            elif not self.pd and sda:
+                self.stops += 1
+                self.mode = "idle"
+                sda_out(1)
+        if not self.ps and scl:                                     # SCL rise: sample
+            if self.mode in ("addr", "wr"):
+                self.sh = ((self.sh << 1) | sda) & 0xFF
+                self.bits += 1
+            elif self.mode == "rack":
+                self.mack = sda
+        if self.ps and not scl:                                     # SCL fall: act
+            m = self.mode
+            if m == "addr" and self.bits == 8:
+                if self.sh >> 1 == 0x50:
+                    self.rw, self.mode = self.sh & 1, "aack"
+                    sda_out(0)
+                else:
+                    self.mode = "idle"
+            elif m == "aack":
+                sda_out(1)
+                if not self.rw:
+                    self.mode, self.bits, self.sh, self.first = "wr", 0, 0, True
+                else:
+                    self.mode, self.j, self.cur = "rd", 0, self.mem[self.ptr]
+                    sda_out(self.cur >> 7)
+            elif m == "wr" and self.bits == 8:
+                if self.first:
+                    self.ptr, self.first = self.sh, False
+                else:
+                    self.mem[self.ptr] = self.sh
+                    self.ptr = (self.ptr + 1) & 0xFF
+                sda_out(0)
+                self.mode = "wack"
+            elif m == "wack":
+                sda_out(1)
+                self.mode, self.bits, self.sh = "wr", 0, 0
+            elif m == "rd":
+                self.j += 1
+                if self.j < 8:
+                    sda_out((self.cur >> (7 - self.j)) & 1)
+                else:
+                    sda_out(1)
+                    self.mode = "rack"
+            elif m == "rack":
+                self.master_acks.append(self.mack)
+                if self.mack == 0:
+                    self.ptr = (self.ptr + 1) & 0xFF
+                    self.cur = self.mem[self.ptr]
+                    self.j, self.mode = 0, "rd"
+                    sda_out(self.cur >> 7)
+                else:
+                    self.mode = "done"
+        self.ps, self.pd = scl, sda
+
+
+async def wait_ready(chip, timeout):
+    """The controller's DONE comes out on the READY pin, uo_out[1]."""
+    for _ in range(timeout):
+        await RisingEdge(chip.dut.clk)
+        if chip.bit(chip.dut.uo_out, 1):
+            return
+    raise AssertionError("READY (uo_out[1]) never went high")
+
+
+async def pop(chip):
+    """Read the oldest received byte over SDO and drop it, in one config word."""
+    await chip.word(GOUT, OUT_HRX)
+    return await chip.word(HRXPOP, 0x00)
+
+
+@cocotb.test()
+async def test_spi_flash_via_controller(dut):
+    """The controller runs SPI by itself: CS, 4 bytes out, 4 bytes in, READY."""
+    chip = await start(dut)
+    flash = SpiFlash()
+    Board(dut, flash)
+    for a, d in [(T0 + 0, 0x54),          # baud mode, CPOL 0 (SCK idles low)
+                 (T0 + 1, 9), (T0 + 2, 15),   # SCK half period 10 clocks, 8 cycles
+                 (T0 + 3, 0x0F),          # SCK on uio[3], push-pull
+                 (T0 + 4, 0x04),          # the controller starts each frame
+                 (S0 + 0, 0x8F),          # TX, MSB first, changes on SCK fall
+                 (S0 + 1, 0x01),          # MOSI on uio[1]
+                 (S1 + 0, 0x44),          # RX, samples on SCK rise
+                 (S1 + 1, 0x02),          # MISO on uio[2]
+                 (CSEL, 0x04),            # controller: TX = shifter 0, RX = shifter 1
+                 (CPMAP0, 0x30),          # controller pin 0 = CS on uio[0], push-pull
+                 (GCTL, 0x01)]:
+        await chip.write(a, d)
+    for a, d in program("spi"):           # load the table
+        await chip.write(a, d)
+    for b in (0x9F, 0x00, 0x00, 0x00):
+        await chip.write(HTX, b)
+    await chip.write(CCTL, 0x03)          # run + GO
+    await wait_ready(chip, 20000)
+    got = [await pop(chip) for _ in range(4)]
+    assert flash.rx == [0x9F, 0x00, 0x00, 0x00], f"flash received {[hex(x) for x in flash.rx]}"
+    assert got == [0xFF, 0xEF, 0x40, 0x18], f"host read {[hex(x) for x in got]} over SDO"
+    assert flash.clocks_without_cs == 0, "SCK toggled while CS was high"
+    assert int(dut.uio_out.value) & 1 == 1, "CS is not back high at the end"
+
+
+@cocotb.test()
+async def test_i2c_eeprom_via_controller(dut):
+    """The controller runs I2C by itself: open drain, START / repeated START / STOP,
+    ACKs, a write then a read, with the SDA hold delay (PHOLD) switched on."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    Board(dut, ee)
+    for a, d in [(T0 + 0, 0x55),          # baud mode, SCL idles high
+                 (T0 + 1, 39), (T0 + 2, 17),  # SCL half period 40 clocks, 9 clocks per byte
+                 (T0 + 3, 0x09),          # SCL on uio[2], open drain
+                 (T0 + 4, 0x3C),          # controller-started, startlow, park, waitpin
+                 (S0 + 0, 0x8D),          # SDA out: TX, MSB first, changes on SCL fall, open drain
+                 (S0 + 1, 0x33),          # 8 bits + released ACK slot, on uio[3]
+                 (S1 + 0, 0x44),          # SDA in: RX, samples on SCL rise
+                 (S1 + 1, 0x23),          # last bit = the ACK, on uio[3]
+                 (CSEL, 0x04),
+                 (CPMAP0, 0x02),          # controller pin 0 READS SCL
+                 (CPMAP1, 0x13),          # controller pin 1 = SDA, open drain (START / STOP)
+                 (PHOLD, 0xF3),           # SDA changes reach the pad 15 clocks late (hold time)
+                 (GCTL, 0x01)]:
+        await chip.write(a, d)
+    for a, d in program("i2c"):
+        await chip.write(a, d)
+    for a, d in [(0x60, 60), (0x61, 0),   # D1: START / STOP hold = 60 clocks
+                 (0x66, 0x20), (0x67, 0x4E)]:   # timeout = 20000 clocks
+        await chip.write(a, d)
+
+    # write: START, 0xA0 (0x50 + W), pointer 0x10, 0xC3, 0x5A, STOP
+    await chip.write(0x6B, 3)             # live counter: 3 bytes after the address
+    await chip.write(0x69, 0)             # no read
+    for b in (0xA0, 0x10, 0xC3, 0x5A):
+        await chip.write(HTX, b)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 50000)
+    # READY rises as the controller ENTERS its last row; with PHOLD the STOP's
+    # SDA rise reaches the wire 15 clocks later - let the bus settle first
+    await chip.clk(100)
+    assert ee.mem[0x10:0x12] == [0xC3, 0x5A], f"EEPROM holds {[hex(x) for x in ee.mem[0x10:0x12]]}"
+    assert (ee.starts, ee.stops) == (1, 1), f"write: {ee.starts} START(s), {ee.stops} STOP(s)"
+
+    # read: START, 0xA0, pointer 0x10, repeated START, 0xA1 (0x50 + R), 2 bytes, STOP
+    await chip.write(0x6B, 1)             # 1 byte after the address (the pointer)
+    await chip.write(0x69, 2)             # read 2
+    for b in (0xA0, 0x10, 0xA1):
+        await chip.write(HTX, b)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 50000)
+    await chip.clk(100)
+    got = [await pop(chip) for _ in range(2)]
+    assert got == [0xC3, 0x5A], f"host read {[hex(x) for x in got]} over SDO"
+    assert (ee.starts, ee.stops) == (3, 2), f"total {ee.starts} STARTs, {ee.stops} STOPs (want 3, 2)"
+    assert ee.master_acks == [0, 1], f"master ACK/NACK {ee.master_acks}: want ACK then NACK"
+    assert (int(dut.uio_oe.value) >> 2) & 0b11 == 0, "SCL / SDA still driven at the end"
