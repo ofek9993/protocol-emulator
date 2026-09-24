@@ -4,7 +4,7 @@
  *
  * The pool is 2 timers + 2 shifters (NT / NS below). The design runs one
  * protocol at a time, and 2 + 2 covers UART full duplex, SPI with MISO, I2C,
- * JTAG IDCODE and SWD (model/JTAG_SWD_PAPER.md). Full JTAG would need a third
+ * JTAG IDCODE and SWD (refmodel/checks/JTAG_SWD_PAPER.md). Full JTAG would need a third
  * shifter: NS = 3, plus widening the 1-bit shifter-select fields.
  *
  * Nothing in here knows what a protocol is. Two ways to use it:
@@ -85,6 +85,8 @@
  *                  [3] startlow output goes low the instant it starts
  *                  [4] park     at stop, keep the last level
  *                  [5] waitpin  count the high phase from the REAL rise
+ *     +5  TIMPRE   tick prescaler: the timer counts every (N+1)-th clock;
+ *                  0 = every clock (AUDIT B28: UART below 97.6 kbaud, PS/2)
  *
  *   shifter n at 0x30 + n*8   (n = 0, 1):
  *     +0  SHCTL    [7:6] smod  [4] timsel  [3] timpol  [2] dir
@@ -169,6 +171,7 @@ module pemu_core (
     reg [7:0] tim_cmph [0:NT-1];
     reg [7:0] tim_pin  [0:NT-1];
     reg [7:0] tim_pol  [0:NT-1];
+    reg [7:0] tim_pre  [0:NT-1];      // TIMPRE (timer + 5): tick prescaler, AUDIT B28
     reg [7:0] sh_ctl   [0:NS-1];
     reg [7:0] sh_cfg   [0:NS-1];
     reg [7:0] sh_lutl  [0:NS-1];
@@ -190,6 +193,7 @@ module pemu_core (
                 tim_cmph[n] <= 8'h00;
                 tim_pin [n] <= 8'h00;
                 tim_pol [n] <= 8'h00;
+                tim_pre [n] <= 8'h00;
             end
             for (n = 0; n < NS; n = n + 1) begin
                 sh_ctl  [n] <= 8'h00;
@@ -212,6 +216,7 @@ module pemu_core (
                     if ({24'd0, cfg_addr} == 32'h10 + n*8 + 2) tim_cmph[n] <= cfg_data;
                     if ({24'd0, cfg_addr} == 32'h10 + n*8 + 3) tim_pin [n] <= cfg_data;
                     if ({24'd0, cfg_addr} == 32'h10 + n*8 + 4) tim_pol [n] <= cfg_data;
+                    if ({24'd0, cfg_addr} == 32'h10 + n*8 + 5) tim_pre [n] <= cfg_data;
                 end
                 for (n = 0; n < NS; n = n + 1) begin
                     if ({24'd0, cfg_addr} == 32'h30 + n*8 + 0) sh_ctl [n] <= cfg_data;
@@ -243,6 +248,7 @@ module pemu_core (
     reg [NS-1:0] c_we;                // the controller writing a shifter's buffer
     reg [7:0]  c_wdata;
     reg        c_trig, c_release;     // one-clock pulses to the timers
+    reg        c_abort;               // one-clock pulse: a timeout ended the transfer (AUDIT B27)
     reg        frame_done, rx_avail, rx_stat_d;
     reg        stop_ovr_en, stop_ovr_val, frame_pend;
 
@@ -298,7 +304,7 @@ module pemu_core (
         if (!rst_n) begin
             c_run <= 1'b0; c_go <= 1'b0; c_done <= 1'b0; c_under <= 1'b0; c_over <= 1'b0;
             c_tx <= 1'b0; c_rx <= 1'b0; cp_val <= 4'hF; c_we <= {NS{1'b0}}; c_wdata <= 8'd0;
-            c_trig <= 1'b0; c_release <= 1'b0;
+            c_trig <= 1'b0; c_release <= 1'b0; c_abort <= 1'b0;
             frame_done <= 1'b0; rx_avail <= 1'b0; rx_stat_d <= 1'b1;
             stop_ovr_en <= 1'b0; stop_ovr_val <= 1'b1; frame_pend <= 1'b1;
             htx_n <= 3'd0; htx_rd <= 2'd0; htx_wr <= 2'd0;
@@ -306,6 +312,7 @@ module pemu_core (
             for (m = 0; m < 4; m = m + 1) cp_map[m] <= 6'd0;
         end else begin
             c_go <= 1'b0; c_we <= {NS{1'b0}}; c_trig <= 1'b0; c_release <= 1'b0;
+            c_abort <= a_tmo;                 // a timeout exit was taken: abort the datapath
 
             // ---- host side
             if (cfg_we) begin
@@ -396,12 +403,14 @@ module pemu_core (
                 .trgpol (tim_ctl[g][1]),
                 .pinpol (tim_pol[g][0]),
                 .decsrc (tim_pol[g][1]),
+                .prediv (tim_pre[g]),
                 .ctrig  (tim_pol[g][2]),
                 .startlow(tim_pol[g][3]),
                 .park   (tim_pol[g][4]),
                 .waitpin(tim_pol[g][5]),
                 .ctrl_trig  (c_trig),
                 .release_clk(c_release),
+                .abort  (c_abort),
                 .trigger_in(trg_bus[trgsel]),
                 .pin_in (pin_in[pinsel]),
                 .timer_out   (timer_out[g]),
@@ -428,6 +437,7 @@ module pemu_core (
                 .lut    ({sh_luth[g][4:0], sh_lutl[g]}),
                 .timer_out (timer_eff[timsel]),    // the clock as the wire sees it
                 .timer_done(timer_done[timsel]),   // B3: was never connected
+                .abort  (c_abort),
                 .wdata  (c_we[g] ? c_wdata : sh_wdata),
                 .we     (sh_we[g] | c_we[g]),
                 .rdata  (sh_rdata[g]),
@@ -537,7 +547,7 @@ module pemu_core (
         .hold_pin(phold[3:0]), .hold_n(phold[7:4])
     );
 
-    wire _unused = &{ui_in[7], c_entering, a_tmo, gctl[7:2], gout[7:4], 1'b0};   // reserved bits
+    wire _unused = &{ui_in[7], c_entering, gctl[7:2], gout[7:4], 1'b0};   // reserved bits
 
 endmodule
 

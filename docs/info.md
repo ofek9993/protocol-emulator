@@ -16,7 +16,9 @@ Three layers:
   clock stretching and timeouts by itself.
 - **Datapath** - 2 timers + 2 shifters wired by configuration. A timer makes
   the bit clock, a shifter moves bits in or out on it (with start/stop bits,
-  MSB/LSB first, open drain or push-pull).
+  MSB/LSB first, open drain or push-pull). Each timer has a tick prescaler
+  (`0x15+8n`), so slow rates like 9600 baud fit too. A controller timeout
+  also stops the timers and shifters, releasing the bus.
 - **Pin layer** - 2-flop synchronisers and a 3-sample glitch filter on every
   protocol input, registered outputs, safe reset levels, and an optional
   output hold delay on one pad (I2C SDA hold time).

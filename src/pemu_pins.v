@@ -25,7 +25,7 @@
  *        high (a UART TX line must idle high), SDO and READY low.
  *
  * Nothing else in the design may read uio_in or ui_in[6:3]; the structural
- * check (test/structural_check.py) enforces that - B18 cannot be shown in a
+ * check (test/tools/structural_check.py) enforces that - B18 cannot be shown in a
  * zero-delay simulation, so it is checked by structure instead.
  *
  * Logical pin space (4-bit pin numbers used by timers, shifters, controller):

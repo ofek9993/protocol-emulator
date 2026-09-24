@@ -38,8 +38,23 @@ test/output/
 ARCHITECTURE.md
 AUDIT.md
 BUILD_LOG.md
-model/
+/programs/
+/refmodel/
 test/unit/
-test/structural_check.py
-test/trace_tool.py
-test/viz/
+test/chip/
+test/legacy/
+test/harness/
+test/tools/
+# test/datapath_configs/: CI's test.py loads these three; the rest stay local
+test/datapath_configs/*
+!test/datapath_configs/uart_1m_8n1.hex
+!test/datapath_configs/uart_9600_8n1.hex
+!test/datapath_configs/i2c_test_fast.hex
+test/config_lists/
+test/run.sh
+test/VERIFICATION.md
+# test/programs/: CI's test.py needs the SPI and I2C tables; the rest stay local
+test/programs/*
+!test/programs/prog_spi.hex
+!test/programs/prog_i2c.hex
+!test/programs/prog_uart.hex

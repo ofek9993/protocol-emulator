@@ -112,6 +112,7 @@ module pemu_shifter (
     // ---- from the selected timer ---------------------------------------
     input  wire        timer_out,  // the shift clock
     input  wire        timer_done, // frame boundary (one-cycle pulse)
+    input  wire        abort,      // controller: a timeout ended the transfer (AUDIT B27)
 
     // ---- data interface ------------------------------------------------
     input  wire [7:0]  wdata,
@@ -272,6 +273,21 @@ module pemu_shifter (
             frame_err   <= 1'b0;
             buf_full    <= 1'b0;
             rx_void     <= 1'b0;
+
+        end else if (abort) begin
+            // AUDIT B27: the transfer was abandoned. Drop the frame in
+            // progress AND the byte waiting in the buffer (it belongs to the
+            // failed transfer - it must not go out first in the next one).
+            // The sticky error flags are KEPT, so the host can still read
+            // what went wrong; in receive the "byte arrived" flag is left
+            // alone (setting it would look like a byte arriving).
+            sr          <= 10'h3FF;         // TX output back to its idle 1 (open drain: released)
+            bitcnt      <= 4'd0;
+            active      <= 1'b0;
+            buf_full    <= 1'b0;
+            lut_state   <= 1'b0;
+            rx_void     <= 1'b0;
+            if (smod == ST_TX) status_flag <= 1'b1;   // buffer empty
 
         end else if (smod == ST_TX) begin
             // =========================== TRANSMIT ===========================

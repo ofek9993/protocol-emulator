@@ -183,8 +183,8 @@ OUT_HRX = 8
 
 def program(name):
     """The state table exactly as the chip loads it: one {addr, data} word per line
-    (written by model/export_programs.py, identical to the RTL benches' copy)."""
-    with open(os.path.join(HERE, "prog_%s.hex" % name)) as f:
+    (test/programs/, written by programs/build.py - the same files the RTL benches load)."""
+    with open(os.path.join(HERE, "programs", "prog_%s.hex" % name)) as f:
         return [(int(l, 16) >> 8, int(l, 16) & 0xFF) for l in f if l.strip()]
 
 
@@ -272,6 +272,7 @@ class I2cEeprom:
         self.ps, self.pd = 1, 1
         self.starts = self.stops = 0
         self.master_acks = []
+        self.hold_scl = False           # True: after its next ACK it holds SCL low for ever (a dead bus)
 
     def step(self, b, pad):
         scl, sda = (pad >> 2) & 1, (pad >> 3) & 1
@@ -304,6 +305,8 @@ class I2cEeprom:
                     self.mode = "idle"
             elif m == "aack":
                 sda_out(1)
+                if self.hold_scl:
+                    b.drive(2, 0)                                   # a dead bus: SCL held low for ever
                 if not self.rw:
                     self.mode, self.bits, self.sh, self.first = "wr", 0, 0, True
                 else:
@@ -438,3 +441,128 @@ async def test_i2c_eeprom_via_controller(dut):
     assert (ee.starts, ee.stops) == (3, 2), f"total {ee.starts} STARTs, {ee.stops} STOPs (want 3, 2)"
     assert ee.master_acks == [0, 1], f"master ACK/NACK {ee.master_acks}: want ACK then NACK"
     assert (int(dut.uio_oe.value) >> 2) & 0b11 == 0, "SCL / SDA still driven at the end"
+
+
+# ---------------------------------------------------------------- the B27 / B28 / B29 fixes
+# These load the SAME datapath configurations the local Verilog benches run
+# (test/datapath_configs/<name>.hex, written by programs/datapath_configs.py),
+# after the program - the documented load order.
+
+def config(name):
+    """A datapath configuration, one {addr, data} word per line."""
+    with open(os.path.join(HERE, "datapath_configs", name + ".hex")) as f:
+        return [(int(l, 16) >> 8, int(l, 16) & 0xFF) for l in f if l.strip()]
+
+
+async def load(chip, prog, cfg):
+    for a, d in program(prog) + config(cfg):
+        await chip.write(a, d)
+
+
+async def send_frames(chip, data, bit):
+    """Independent UART transmitter on ui_in[3]: 8N1 frames BACK TO BACK -
+    the next start bit follows the stop bit with no idle time at all."""
+    for b in data:
+        for level in [0] + [(b >> k) & 1 for k in range(8)] + [1]:
+            chip.rx = level; chip._put()
+            await chip.clk(bit)
+
+
+async def decode_frame(chip, bit, timeout):
+    """Independent UART receiver on uo_out[4] at `bit` clocks per bit; also
+    measures how long the start bit really is - as the time the line stays
+    low, so the byte MUST have bit 0 = 1 (else start + d0 look like one)."""
+    for _ in range(timeout):
+        await RisingEdge(chip.dut.clk)
+        if chip.bit(chip.dut.uo_out, 4) == 0:
+            break
+    else:
+        raise AssertionError("no start bit on uo_out[4]")
+    width = 0
+    while chip.bit(chip.dut.uo_out, 4) == 0 and width < 4 * bit:
+        await RisingEdge(chip.dut.clk)
+        width += 1
+    await ClockCycles(chip.dut.clk, bit // 2)                   # at the end of the start bit: half a bit on = the middle of d0
+    b = 0
+    for k in range(8):
+        b |= chip.bit(chip.dut.uo_out, 4) << k
+        await ClockCycles(chip.dut.clk, bit)
+    assert chip.bit(chip.dut.uo_out, 4) == 1, "stop bit not high"
+    return b, width
+
+
+@cocotb.test()
+async def test_uart_back_to_back_via_controller(dut):
+    """B29: at 1 Mbaud a peer sends 4 frames with NO gap between them (how real
+    UARTs send). The receiver must be free again by the middle of each stop
+    bit to catch the next start bit - all 4 must arrive, in order."""
+    chip = await start(dut)
+    await load(chip, "uart", "uart_1m_8n1")
+    await chip.write(CCTL, 0x01)              # RUN: the table serves both directions
+    await chip.clk(200)
+    sent = [0xA0, 0xD9, 0x7E, 0x4D]
+    await send_frames(chip, sent, 50)         # 1 Mbaud = 50 clocks a bit
+    chip.rx = 1; chip._put()
+    await chip.clk(200)
+    got = [await pop(chip) for _ in range(4)]
+    assert got == sent, f"sent {[hex(x) for x in sent]} back to back, host read {[hex(x) for x in got]}"
+    assert await chip.read(10) & 0b10 == 0, "RX overflow flagged"
+
+
+@cocotb.test()
+async def test_uart_9600_via_controller(dut):
+    """B28: 9600 baud through the timers' prescaler (TIMPRE). The chip's byte is
+    decoded at the REAL 9600 baud (5208 clocks a bit) and its start bit
+    measured; a byte sent at the real rate arrives."""
+    chip = await start(dut)
+    await load(chip, "uart", "uart_9600_8n1")
+    await chip.write(CCTL, 0x01)
+    await chip.clk(200)
+    dec = cocotb.start_soon(decode_frame(chip, 5208, 30000))
+    await chip.write(HTX, 0xA5)               # bit 0 = 1: the start bit can be measured
+    b, width = await dec
+    assert b == 0xA5, f"decoded 0x{b:02x} at 9600 baud"
+    assert abs(width - 5208) <= 30, f"start bit {width} clocks, 9600 baud is 5208"
+    await send_frames(chip, [0xA3], 5208)
+    chip.rx = 1; chip._put()
+    await chip.clk(2000)
+    got = await pop(chip)
+    assert got == 0xA3, f"host read 0x{got:02x}, the peer sent 0xa3 at 9600 baud"
+
+
+@cocotb.test()
+async def test_i2c_dead_bus_via_controller(dut):
+    """B27: the EEPROM holds SCL low for ever. The controller must time out AND
+    let go of the bus - neither SCL nor SDA driven by us - and nothing may
+    happen when the slave lets go. After clear + flush (no reset, no reload)
+    a normal write and read-back work."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    board = Board(dut, ee)
+    await load(chip, "i2c", "i2c_test_fast")
+    ee.hold_scl = True
+    await chip.write(0x6B, 2)                 # 2 bytes after the address
+    await chip.write(0x69, 0)
+    for b in (0xA0, 0x10, 0xC3):
+        await chip.write(HTX, b)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 20000)
+    st = await chip.read(OUT_CSTAT)
+    assert st & 0b10, f"status 0x{st:02x}: no timeout reported"
+    oe = int(dut.uio_oe.value)
+    assert (oe >> 2) & 0b11 == 0, f"after the timeout our chip still drives SCL / SDA (uio_oe = 0x{oe:02x})"
+    ee.hold_scl = False
+    board.drive(2, None)                      # the slave lets go
+    ee.mode = "idle"
+    await chip.clk(500)
+    oe = int(dut.uio_oe.value)
+    assert (oe >> 2) & 1 == 0, "SCL driven again after the slave let go (a parked frame)"
+    await chip.write(CCTL, 0x0D)              # clear flags + flush: the recovery a NACK needs too
+    await chip.write(0x6B, 3)                 # write C3 5A at 0x10: 3 bytes after the address
+    await chip.write(0x69, 0)
+    for b in (0xA0, 0x10, 0xC3, 0x5A):
+        await chip.write(HTX, b)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 20000)
+    await chip.clk(100)
+    assert ee.mem[0x10:0x12] == [0xC3, 0x5A], f"after recovery the EEPROM holds {[hex(x) for x in ee.mem[0x10:0x12]]}"

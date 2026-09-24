@@ -12,8 +12,8 @@
  *                         out, take the timeout exit. Otherwise stay.
  *
  * One transition = one clock. See ARCHITECTURE.md §5.4 and
- * model/TABLE_FORMAT.md. The row layout here must match encode_row() in
- * model/pemu_model.py bit for bit - tb_pemu_ctrl.v replays the Python
+ * programs/TABLE_FORMAT.md. The row layout here must match encode_row() in
+ * refmodel/pemu_model.py bit for bit - tb_pemu_ctrl.v replays the Python
  * model's recorded runs and checks this module does exactly the same.
  *
  * ---------------------------------------------------------------- row layout

@@ -64,6 +64,8 @@ module pemu_timer (
     input  wire        trgpol,       // 0 active high, 1 active low
     input  wire        pinpol,       // 0 active high, 1 invert pin_in
     input  wire        decsrc,       // 0 decrement on clk, 1 on a real pin edge
+    input  wire [7:0]  prediv,       // TIMPRE: count only every (prediv+1)-th clock
+                                     // (AUDIT B28: slow UART, PS/2); 0 = every clock
     // ---- controller options (TIMPOL[5:2]); all 0 = the original behaviour
     input  wire        ctrig,        // 1: start on the controller's frame pulse, not trigger_in
     input  wire        startlow,     // 1: the output goes LOW the instant the timer starts
@@ -72,6 +74,8 @@ module pemu_timer (
                                      //    is really high too - the clock-stretch reflex
     input  wire        ctrl_trig,    // controller: one-clock "run a frame" pulse
     input  wire        release_clk,  // controller: return a parked output to its idle level
+    input  wire        abort,        // controller: a timeout ended the transfer - stop NOW,
+                                     // go idle, no park (AUDIT B27)
 
     // ---- inputs (already selected by the mux in the top level) ---------
     input  wire        trigger_in,
@@ -146,7 +150,13 @@ module pemu_timer (
     // So the high phase is timed from the REAL rise, not from the moment we
     // released, which also absorbs slow pull-up rise times (tb_realism R5).
     wire hold_high = waitpin && timer_out && !pin_in;
-    wire tick      = running && !hold_high && (decsrc ? pin_edge : 1'b1);
+    // TIMPRE (AUDIT B28): with prediv = N the clock-counting tick comes only
+    // every N+1 clocks, so one half bit can be up to 256 x 256 clocks - 9600
+    // baud and slower fit, and the dual mode still counts the frame's bits.
+    // prediv = 0: pre_cnt stays 0, every clock is a tick - exactly as before.
+    reg  [7:0] pre_cnt;
+    wire pre_zero  = (pre_cnt == 8'd0);
+    wire tick      = running && !hold_high && (decsrc ? pin_edge : pre_zero);
     // What the shifters see as their clock. Two rules:
     //  * waitpin: it only goes high once the WIRE is high, so a receiver
     //    samples on the real rise, not the moment we let go;
@@ -186,13 +196,26 @@ module pemu_timer (
             lo_cnt     <= 8'd0;
             hi_cnt     <= 8'd0;
             wide_cnt   <= 16'd0;
+            pre_cnt    <= 8'd0;
         end else begin
+            // the prescaler: reloads at a frame's start, then counts down to 0
+            // and reloads - one tick each time it is at 0 (see `tick`)
+            if (!running)                    pre_cnt <= prediv;
+            else if (!hold_high && !decsrc)  pre_cnt <= pre_zero ? prediv : pre_cnt - 8'd1;
             timer_done <= 1'b0;
 
             if (!cfg_on) begin
                 running   <= 1'b0;
                 parked    <= 1'b0;
                 timer_out <= timout;
+            end else if (abort) begin
+                // AUDIT B27: a timeout ends the whole transfer, not just the
+                // table. Without this the frame ran on (waiting for a held
+                // SCL) and then PARKED low when the slave let go - holding
+                // the bus with nothing left to release it.
+                running   <= 1'b0;
+                parked    <= 1'b0;
+                timer_out <= timout;          // I2C: SCL released
             end else if (!running) begin
                 // idle: hold the configured output level, wait to start -
                 // unless parked, in which case hold the level we stopped at
@@ -237,8 +260,15 @@ module pemu_timer (
                 if (stop_cond) begin
                     running    <= 1'b0;
                     timer_done <= 1'b1;
-                    if (park) parked    <= 1'b1;   // keep this clock's level
-                    else      timer_out <= timout;
+                    if (park) parked <= 1'b1;   // keep this clock's level
+                    // AUDIT B29: the LAST toggle is allowed to happen. The idle
+                    // branch returns timer_out to timout on the next clock by
+                    // itself. Forcing it here overrode that toggle on the same
+                    // clock, so a frame could never end ON a sampling edge (a
+                    // UART receiver stopping in the middle of the stop bit
+                    // lost that sample). Frames of an even number of toggles
+                    // (SPI, I2C, UART TX) already end at the idle level:
+                    // unchanged.
                 end
             end
         end
