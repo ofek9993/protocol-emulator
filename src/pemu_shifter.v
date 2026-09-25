@@ -113,6 +113,7 @@ module pemu_shifter (
     input  wire        timer_out,  // the shift clock
     input  wire        timer_done, // frame boundary (one-cycle pulse)
     input  wire        abort,      // controller: a timeout ended the transfer (AUDIT B27)
+    input  wire        clr_err,    // pulse: the host clears overrun / frame_err (CCTL[2], AUDIT B31)
 
     // ---- data interface ------------------------------------------------
     input  wire [7:0]  wdata,
@@ -261,7 +262,14 @@ module pemu_shifter (
             frame_err   <= 1'b0;
             sh_buf      <= 8'd0;
             buf_full    <= 1'b0;
-        end else if (!enable || smod == 2'd0) begin
+        end else begin
+        // AUDIT B31: the host clears the sticky error flags (CCTL[2]) WITHOUT
+        // switching the shifter off - a full-duplex UART can clear an RX
+        // framing error while its TX keeps sending. Written FIRST, so an error
+        // raised on the same clock (assigned further down) still wins: a clear
+        // never swallows a new error.
+        if (clr_err) begin overrun <= 1'b0; frame_err <= 1'b0; end
+        if (!enable || smod == 2'd0) begin
             // Disabled: hold everything in a clean idle state. Sticky error
             // flags clear here too, so re-enabling gives a fresh start.
             sr          <= 10'h3FF;
@@ -381,6 +389,7 @@ module pemu_shifter (
                 lut_state <= 1'b0;
             end
         end
+        end   // the B31 clear's else
     end
 
     // lut[12] and the LUT's pat1 output feed the 1-bit -> 2-symbol path

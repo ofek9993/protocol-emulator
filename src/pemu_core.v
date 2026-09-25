@@ -44,12 +44,17 @@
  * the pop happens at CS rise).
  *
  * -------------------------------------------------------- register map
- *   0x00  GCTL     [0] enable  [1] input glitch filter OFF (default on)
+ *   0x00  GCTL     [0] enable: timers and shifters count AND drive their
+ *                      pads only while 1 (AUDIT B34)  [1] input glitch filter
+ *                      OFF (default on)  [2] LONG filter: 4 samples instead of
+ *                      3 - rejects spikes under 60 ns (I2C Fast / Fast+ tSP,
+ *                      AUDIT B36); one more clock of input latency
  *   0x01  GOUT     [3:0] which byte the read-back returns:
  *                    0..1 = shifter n received data
  *                    4    = status flags   (TX ready / RX byte available)
  *                    5    = overrun flags  (a write arrived while busy)
  *                    6    = framing errors (RX stop bit was wrong)
+ *                           (5, 6: sticky; CCTL[2] clears them, AUDIT B31)
  *                    7    = timer active flags
  *                    8    = host RX FIFO: the oldest byte
  *                    9    = controller status {state[3:0], tx_full,
@@ -61,7 +66,8 @@
  *                           host learns how far the write got)
  *                    others = 0
  *   0x02  CCTL     [0] controller run  [1] write 1 = "go" (a pulse)
- *                  [2] write 1 = clear done / underflow / overflow
+ *                  [2] write 1 = clear done / underflow / overflow, and
+ *                      the shifters' overrun + framing-error flags (AUDIT B31)
  *                  [3] write 1 = flush both host FIFOs (e.g. the unsent
  *                      bytes left behind when a slave NACKs a write)
  *   0x03  HTX      push a byte into the host TX FIFO (4 deep)
@@ -230,7 +236,8 @@ module pemu_core (
     end
 
     wire enable  = gctl[0];
-    wire filt_on = ~gctl[1];
+    wire filt_on   = ~gctl[1];
+    wire filt_long =  gctl[2];          // AUDIT B36: 4-sample input filter (I2C Fast / Fast+ tSP)
 
     // ==================================================================
     // the pin layer's clean view of every logical pin
@@ -249,6 +256,7 @@ module pemu_core (
     reg [7:0]  c_wdata;
     reg        c_trig, c_release;     // one-clock pulses to the timers
     reg        c_abort;               // one-clock pulse: a timeout ended the transfer (AUDIT B27)
+    reg        c_clrerr;              // one-clock pulse: CCTL[2] - clear the shifters' error flags (AUDIT B31)
     reg        frame_done, rx_avail, rx_stat_d;
     reg        stop_ovr_en, stop_ovr_val, frame_pend;
 
@@ -304,14 +312,14 @@ module pemu_core (
         if (!rst_n) begin
             c_run <= 1'b0; c_go <= 1'b0; c_done <= 1'b0; c_under <= 1'b0; c_over <= 1'b0;
             c_tx <= 1'b0; c_rx <= 1'b0; cp_val <= 4'hF; c_we <= {NS{1'b0}}; c_wdata <= 8'd0;
-            c_trig <= 1'b0; c_release <= 1'b0; c_abort <= 1'b0;
+            c_trig <= 1'b0; c_release <= 1'b0; c_abort <= 1'b0; c_clrerr <= 1'b0;
             frame_done <= 1'b0; rx_avail <= 1'b0; rx_stat_d <= 1'b1;
             stop_ovr_en <= 1'b0; stop_ovr_val <= 1'b1; frame_pend <= 1'b1;
             htx_n <= 3'd0; htx_rd <= 2'd0; htx_wr <= 2'd0;
             hrx_n <= 3'd0; hrx_rd <= 2'd0; hrx_wr <= 2'd0;
             for (m = 0; m < 4; m = m + 1) cp_map[m] <= 6'd0;
         end else begin
-            c_go <= 1'b0; c_we <= {NS{1'b0}}; c_trig <= 1'b0; c_release <= 1'b0;
+            c_go <= 1'b0; c_we <= {NS{1'b0}}; c_trig <= 1'b0; c_release <= 1'b0; c_clrerr <= 1'b0;
             c_abort <= a_tmo;                 // a timeout exit was taken: abort the datapath
 
             // ---- host side
@@ -320,7 +328,7 @@ module pemu_core (
                     8'h02: begin
                         c_run <= cfg_data[0];
                         if (cfg_data[1]) begin c_go <= 1'b1; c_done <= 1'b0; end
-                        if (cfg_data[2]) begin c_done <= 1'b0; c_under <= 1'b0; c_over <= 1'b0; end
+                        if (cfg_data[2]) begin c_done <= 1'b0; c_under <= 1'b0; c_over <= 1'b0; c_clrerr <= 1'b1; end
                     end
                     8'h05: begin c_tx <= cfg_data[0]; c_rx <= cfg_data[2]; end
                     8'h08: cp_map[0] <= cfg_data[5:0];
@@ -438,6 +446,7 @@ module pemu_core (
                 .timer_out (timer_eff[timsel]),    // the clock as the wire sees it
                 .timer_done(timer_done[timsel]),   // B3: was never connected
                 .abort  (c_abort),
+                .clr_err(c_clrerr),
                 .wdata  (c_we[g] ? c_wdata : sh_wdata),
                 .we     (sh_we[g] | c_we[g]),
                 .rdata  (sh_rdata[g]),
@@ -468,6 +477,13 @@ module pemu_core (
     // so the pad is released for a 1 and pulled low for a 0. (An extra
     // "od_mask" on the value was found dead by mutation testing and removed.)
     // On an output-only pad (12..15) "released" reads as high.
+    //
+    // AUDIT B34: timers and shifters drive a pad ONLY while the datapath is
+    // on (GCTL[0]). With it off - while the host writes a configuration one
+    // register at a time - a half-written block (drive already set, pin not
+    // yet) cannot reach any pad, and "datapath off" really releases them.
+    // The controller's pin lines are NOT gated: they belong to the table
+    // (SPI's CS stays a clean high while the host reconfigures).
     // ==================================================================
     integer p, k;
     always @* begin
@@ -476,7 +492,7 @@ module pemu_core (
         for (p = 0; p < 16; p = p + 1) begin
             for (k = 0; k < NT; k = k + 1) begin
                 // timers first, so a shifter on the same pin overrides
-                if (tim_pin[k][1:0] != 2'd0 && tim_pin[k][5:2] == p[3:0]) begin
+                if (enable && tim_pin[k][1:0] != 2'd0 && tim_pin[k][5:2] == p[3:0]) begin
                     pin_val[p] = timer_out[k];
                     pin_drv[p] = (tim_pin[k][1:0] == 2'd1)
                                  ? ~timer_out[k]     // open drain
@@ -484,7 +500,7 @@ module pemu_core (
                 end
             end
             for (k = 0; k < NS; k = k + 1) begin
-                if (sh_ctl[k][1:0] != 2'd0 && sh_cfg[k][3:0] == p[3:0]
+                if (enable && sh_ctl[k][1:0] != 2'd0 && sh_cfg[k][3:0] == p[3:0]
                     && sh_pin_oe[k]) begin
                     pin_val[p] = sh_pin_out[k];
                     pin_drv[p] = (sh_ctl[k][1:0] == 2'd1)
@@ -539,7 +555,7 @@ module pemu_core (
     // the pin layer: the only place that touches the protocol pads
     // ==================================================================
     pemu_pins u_pins (
-        .clk(clk), .rst_n(rst_n), .filt_on(filt_on),
+        .clk(clk), .rst_n(rst_n), .filt_on(filt_on), .filt_long(filt_long),
         .uio_in(uio_in), .ui_proto(ui_in[6:3]),
         .uio_out(uio_out), .uio_oe(uio_oe), .uo_out(uo_out),
         .pin_in(pin_in), .pin_val(pin_val), .pin_drv(pin_drv),

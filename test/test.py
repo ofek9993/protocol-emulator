@@ -11,6 +11,16 @@ synthesis (`make GATES=yes`), so it never looks inside the chip.
 A config write is 16 bits {addr, data}, MSB first, one SCK pulse per bit,
 committed when CS rises. Read-back: the byte selected by GOUT (0x01) is
 shifted out on SDO, MSB first, during the next word.
+
+The suite, one short test per feature (the long sweeps, 256-value runs,
+teeth and mutations live in the local benches - too slow for gate level):
+  A  the chip itself    reset levels, register read-back, read-back codes after reset
+  B  UART               TX, RX, back to back, 9600 baud, framing error + break
+  C  SPI                a flash's read ID, all four modes + LSB first
+  D  I2C                write / read, dead bus, no device, clock stretching,
+                        bus-free time (B32), bus clear (B35), long filter (B36)
+  E  the whole chip     datapath off releases the pins (B34), protocol
+                        switching without reset (B33), reset mid-transfer
 """
 
 import cocotb
@@ -46,24 +56,27 @@ class Chip:
         await ClockCycles(self.dut.clk, n)
         await FallingEdge(self.dut.clk)          # drive on the falling edge
 
-    async def word(self, addr, data, nbits=16):
-        """One config word; returns the byte read back on SDO meanwhile."""
+    async def word(self, addr, data, nbits=16, strict=True):
+        """One config word; returns the byte read back on SDO meanwhile.
+        strict = False: the caller does not use that byte, so an undefined SDO
+        bit is fine (e.g. the head of an EMPTY RX FIFO - AUDIT B39)."""
         w, got = (addr << 8) | data, 0
         self.cfg &= ~0b100; self._put(); await self.clk(3)          # CS low
         for k in range(15, 15 - nbits, -1):
             self.cfg = (self.cfg & ~0b010) | (((w >> k) & 1) << 1); self._put(); await self.clk(3)
-            if k >= 8:
-                got = (got << 1) | self.bit(self.dut.uo_out, 0)     # sample SDO as SCK rises
+            if k >= 8:                                              # sample SDO as SCK rises
+                v = self.dut.uo_out.value
+                got = (got << 1) | (self.bit(self.dut.uo_out, 0) if strict or v.is_resolvable else 0)
             self.cfg |= 0b001; self._put(); await self.clk(3)       # SCK rise
             self.cfg &= ~0b001; self._put(); await self.clk(3)
         self.cfg |= 0b100; self._put(); await self.clk(4)           # CS rise: commit
         return got
 
     async def write(self, addr, data):
-        await self.word(addr, data)
+        await self.word(addr, data, strict=False)
 
     async def read(self, sel):
-        await self.word(GOUT, sel)
+        await self.word(GOUT, sel, strict=False)
         return await self.word(0xFF, 0x00, nbits=8)                 # 8 bits: too short to commit
 
     async def uart_decode(self, timeout=20 * UBIT):
@@ -273,12 +286,24 @@ class I2cEeprom:
         self.starts = self.stops = 0
         self.master_acks = []
         self.hold_scl = False           # True: after its next ACK it holds SCL low for ever (a dead bus)
+        self.stretch, self.hold, self.stretches = 0, 0, 0   # > 0: hold SCL low that many clocks after each ACK
 
     def step(self, b, pad):
         scl, sda = (pad >> 2) & 1, (pad >> 3) & 1
 
         def sda_out(v):                                             # 1 = release, 0 = pull low
             b.drive(3, None if v else 0)
+
+        def stretch():                                              # clock stretching after an ACK
+            if self.stretch:
+                b.drive(2, 0)
+                self.hold = self.stretch
+                self.stretches += 1
+
+        if self.hold:
+            self.hold -= 1
+            if self.hold == 0:
+                b.drive(2, None)
 
         if self.ps and scl:                                         # SDA moving while SCL high
             if self.pd and not sda:
@@ -305,6 +330,7 @@ class I2cEeprom:
                     self.mode = "idle"
             elif m == "aack":
                 sda_out(1)
+                stretch()
                 if self.hold_scl:
                     b.drive(2, 0)                                   # a dead bus: SCL held low for ever
                 if not self.rw:
@@ -322,6 +348,7 @@ class I2cEeprom:
                 self.mode = "wack"
             elif m == "wack":
                 sda_out(1)
+                stretch()
                 self.mode, self.bits, self.sh = "wr", 0, 0
             elif m == "rd":
                 self.j += 1
@@ -353,7 +380,7 @@ async def wait_ready(chip, timeout):
 
 async def pop(chip):
     """Read the oldest received byte over SDO and drop it, in one config word."""
-    await chip.word(GOUT, OUT_HRX)
+    await chip.word(GOUT, OUT_HRX, strict=False)
     return await chip.word(HRXPOP, 0x00)
 
 
@@ -566,3 +593,413 @@ async def test_i2c_dead_bus_via_controller(dut):
     await wait_ready(chip, 20000)
     await chip.clk(100)
     assert ee.mem[0x10:0x12] == [0xC3, 0x5A], f"after recovery the EEPROM holds {[hex(x) for x in ee.mem[0x10:0x12]]}"
+
+
+# ======================================================================
+# The wider suite: every block once, every protocol, every error path and
+# every fix (B31-B36), each short - it also runs on the gate-level netlist,
+# where synthesis mistakes and flops without a reset show up.
+# Pass / fail is decided from the pins only, like everything above.
+# ======================================================================
+from cocotb.triggers import Timer
+
+OUT_OVERRUN, OUT_FRAMEERR, OUT_TIMACTIVE, OUT_CERR, OUT_CCNT = 5, 6, 7, 10, 11
+
+
+class SpiEcho:
+    """An SPI slave in any mode, either bit order, on CS uio[0], MOSI uio[1],
+    MISO uio[2], SCK uio[3]. Byte k of a transaction is answered with the
+    inverse of byte k-1 it received; byte 0 with 0x5A - so one transfer checks
+    MOSI (what it received) and MISO (what the host read back)."""
+
+    def __init__(self, mode=0, msb=True):
+        self.mode, self.msb = mode, msb
+        self.started, self.act = False, False
+        self.rx, self.sh, self.bits, self.ptr, self.base = [], 0, 0, 0, 0
+        self.pcs = self.psck = 1
+
+    def step(self, b, pad):
+        cs, mosi, sck = pad & 1, (pad >> 1) & 1, (pad >> 3) & 1
+        if not self.started:
+            self.pcs, self.psck, self.started = cs, sck, True
+            return
+        rise, fall = (not self.psck and sck), (self.psck and not sck)
+        samp = rise if self.mode in (0, 3) else fall
+        chg = fall if self.mode in (0, 3) else rise
+        if self.pcs and not cs:                                     # selected
+            self.act, self.bits, self.base = True, 0, len(self.rx)
+            self.ptr = -1 if self.mode in (1, 3) else 0             # CPHA 0: bit 7 out before the first edge
+        elif not self.pcs and cs:
+            self.act = False
+        if self.act and not cs:
+            if samp:
+                self.sh = ((self.sh << 1) | mosi) & 0xFF if self.msb else (mosi << 7) | (self.sh >> 1)
+                self.bits += 1
+                if self.bits == 8:
+                    self.rx.append(self.sh)
+                    self.bits = 0
+            if chg:
+                self.ptr += 1
+        if self.act and self.ptr >= 0:
+            k = self.ptr // 8
+            rb = 0x5A if k == 0 else (~self.rx[self.base + k - 1]) & 0xFF
+            b.drive(2, (rb >> (7 - self.ptr % 8)) & 1 if self.msb else (rb >> (self.ptr % 8)) & 1)
+        elif self.act:
+            b.drive(2, 1)
+        else:
+            b.drive(2, None)                                        # deselected: MISO released
+        self.pcs, self.psck = cs, sck
+
+
+class Devices:
+    """Several devices on one board; only the active one takes part."""
+
+    def __init__(self, **devs):
+        self.devs, self.active = devs, None
+
+    def use(self, board, name):
+        board.en = 0                                                # the old device lets go of every pin
+        self.active = name
+
+    def step(self, b, pad):
+        if self.active:
+            self.devs[self.active].step(b, pad)
+
+
+def expected_echo(sent):
+    return [0x5A] + [(~x) & 0xFF for x in sent[:-1]]
+
+
+async def switch_to(chip, prog, cfg):
+    """What a host does to talk to another device: controller stopped,
+    datapath off, the program, the configuration, run + clear + flush."""
+    await chip.write(CCTL, 0x00)
+    await chip.write(GCTL, 0x00)
+    await load(chip, prog, cfg)
+    await chip.write(CCTL, 0x0D)
+
+
+async def spi_txn(chip, data):
+    """One chip-select window of up to 4 bytes; returns what came back."""
+    await chip.write(0x68, len(data))                               # cntA: bytes in this transaction
+    for x in data:
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 20000)
+    return [await pop(chip) for _ in data]
+
+
+async def i2c_write_read(chip, ptr, data):
+    """Write data at ptr, then read it back (pointer, repeated START, read)."""
+    await chip.write(0x6B, len(data) + 1)
+    await chip.write(0x69, 0)
+    for x in [0xA0, ptr] + data:
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 60000)
+    await chip.clk(100)
+    await chip.write(0x6B, 1)
+    await chip.write(0x69, len(data))
+    for x in (0xA0, ptr, 0xA1):
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 60000)
+    await chip.clk(100)
+    return [await pop(chip) for _ in data]
+
+
+# ---------------------------------------------------------------- A · the chip itself
+@cocotb.test()
+async def test_readback_codes_after_reset(dut):
+    """Every read-back code gives its reset value (a flop without a reset would
+    read as X at gate level), and the live counter reads back what was written."""
+    chip = await start(dut)
+    want = {0: 0x00, 1: 0x00, OUT_STATUS: 0x03, OUT_OVERRUN: 0x00, OUT_FRAMEERR: 0x00,
+            OUT_TIMACTIVE: 0x00, OUT_CSTAT: 0x04, OUT_CERR: 0x00, OUT_CCNT: 0x00}
+    for code, v in want.items():
+        got = await chip.read(code)
+        assert got == v, f"read-back code {code}: {got:#04x} after reset, expected {v:#04x}"
+    for v in (0xA5, 0x3C):
+        await chip.write(0x6B, v)
+        got = await chip.read(OUT_CCNT)
+        assert got == v, f"live counter: wrote {v:#04x}, read {got:#04x}"
+
+
+# ---------------------------------------------------------------- B · UART errors
+@cocotb.test()
+async def test_uart_framing_error_and_break(dut):
+    """A bad stop bit is flagged and its data still delivered; CCTL[2] clears the
+    flag WHILE our TX is sending, and the TX byte is unharmed (B31); a break
+    (the line low for 25 bits) gives exactly one 0x00, flagged."""
+    chip = await start(dut)
+    await load(chip, "uart", "uart_1m_8n1")
+    await chip.write(CCTL, 0x01)
+    await chip.clk(200)
+    for level in [0] + [(0x5C >> k) & 1 for k in range(8)] + [0]:   # stop bit 0 = a framing error
+        chip.rx = level; chip._put(); await chip.clk(50)
+    chip.rx = 1; chip._put(); await chip.clk(300)
+    assert await chip.read(OUT_FRAMEERR) & 0b10, "a bad stop bit was not flagged"
+    assert await pop(chip) == 0x5C, "the data bits of the bad frame did not arrive"
+    dec = cocotb.start_soon(decode_frame(chip, 50, 5000))
+    await chip.write(HTX, 0xA5)                                     # our TX is busy ...
+    await chip.write(CCTL, 0x05)                                    # ... while the flag is cleared
+    b, _ = await dec
+    assert b == 0xA5, f"TX byte during the clear decoded as {b:#04x}"
+    assert await chip.read(OUT_FRAMEERR) & 0b10 == 0, "CCTL[2] did not clear the framing error"
+    chip.rx = 0; chip._put(); await chip.clk(25 * 50)               # a BREAK
+    chip.rx = 1; chip._put(); await chip.clk(300)
+    assert await chip.read(OUT_FRAMEERR) & 0b10, "a break was not flagged"
+    assert await pop(chip) == 0x00, "a break must deliver 0x00"
+    assert await chip.read(OUT_CSTAT) & 0b100, "a break delivered more than one byte"
+
+
+# ---------------------------------------------------------------- C · SPI, every mode
+@cocotb.test()
+async def test_spi_all_modes(dut):
+    """The SPI program loaded once; modes 0-3 and LSB first switched in as
+    configurations without a reset; 3 bytes each way per configuration."""
+    chip = await start(dut)
+    board = Board(dut, Devices())
+    for a, d in program("spi"):
+        await chip.write(a, d)
+    for name, mode, msb in [("spi_mode0_2m5", 0, True), ("spi_mode1_2m5", 1, True), ("spi_mode2_2m5", 2, True),
+                            ("spi_mode3_2m5", 3, True), ("spi_mode0_2m5_lsb", 0, False)]:
+        slave = SpiEcho(mode, msb)
+        board.en = 0
+        board.device = slave
+        await chip.write(GCTL, 0x00)
+        for a, d in config(name):
+            await chip.write(a, d)
+        await chip.clk(50)
+        sent = [0x9F, 0x3C, 0xC5]
+        got = await spi_txn(chip, sent)
+        assert slave.rx == sent, f"{name}: the slave received {[hex(x) for x in slave.rx]}"
+        assert got == expected_echo(sent), f"{name}: the host read {[hex(x) for x in got]}"
+        assert int(dut.uio_out.value) & 1 and int(dut.uio_oe.value) & 1, f"{name}: CS not back high"
+
+
+# ---------------------------------------------------------------- D · I2C error paths and fixes
+@cocotb.test()
+async def test_i2c_no_device(dut):
+    """An address nobody answers: START, NACK, STOP - done, no timeout, nothing stored."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    Board(dut, ee)
+    await load(chip, "i2c", "i2c_test_fast")
+    await chip.write(0x6B, 2)
+    await chip.write(0x69, 0)
+    for x in (0xA2, 0x10, 0x77):                                    # 0x51 + W: not the EEPROM
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    await wait_ready(chip, 20000)
+    await chip.clk(100)
+    st = await chip.read(OUT_CSTAT)
+    assert st & 0b10 == 0, "a NACK must not look like a timeout"
+    assert (ee.starts, ee.stops) == (1, 1), f"{ee.starts} START(s), {ee.stops} STOP(s): want one of each"
+    assert ee.mem[0x10] == 0xFF, "something was stored"
+    await chip.write(CCTL, 0x0D)                                    # the host throws the rest away
+
+
+@cocotb.test()
+async def test_i2c_clock_stretching(dut):
+    """The EEPROM holds SCL low after every ACK; the master must wait, not run on."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    ee.stretch = 37
+    Board(dut, ee)
+    await load(chip, "i2c", "i2c_test_fast")
+    got = await i2c_write_read(chip, 0x20, [0x61, 0x9E])
+    assert ee.mem[0x20:0x22] == [0x61, 0x9E], f"stored {[hex(x) for x in ee.mem[0x20:0x22]]}"
+    assert got == [0x61, 0x9E], f"read back {[hex(x) for x in got]}"
+    assert ee.stretches > 4, f"only {ee.stretches} stretches happened"
+
+
+@cocotb.test()
+async def test_i2c_bus_free_time(dut):
+    """B32: the host queues the next transaction while the first still runs;
+    between the STOP and the next START the bus must stay free for Standard
+    mode's tBUF, 4.7 us = 235 clocks - kept by the chip, not by the host."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    ee.mem[0x20], ee.mem[0x30] = 0x11, 0x22
+    board = Board(dut, ee)
+    await load(chip, "i2c", "i2c_standard_100k")
+    gaps, stop_at = [], [None]
+
+    async def watch():                                              # STOP / START on the wires
+        ps, pd, n = 1, 1, 0
+        while True:
+            await RisingEdge(dut.clk)
+            n += 1
+            scl, sda = (board.pad >> 2) & 1, (board.pad >> 3) & 1
+            if ps and scl and not pd and sda:
+                stop_at[0] = n
+            if ps and scl and pd and not sda and stop_at[0] is not None:
+                gaps.append(n - stop_at[0])
+                stop_at[0] = None
+            ps, pd = scl, sda
+    cocotb.start_soon(watch())
+    q = [0xA0, 0x20, 0xA1, 0xA0, 0x30, 0xA1]
+    await chip.write(0x6B, 1)
+    await chip.write(0x69, 1)
+    for x in q[:3]:
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    # a quick host: the status stays selected, so each poll is one short word
+    await chip.word(GOUT, OUT_CSTAT, strict=False)
+    sent, queued = 3, False
+    while not queued:
+        st = await chip.word(0xFF, 0x00, nbits=8)
+        if not st & 0b100:                                          # the first byte is in: queue the next
+            await chip.write(0x6B, 1)                               # transaction AT ONCE - GO while the
+            await chip.write(CCTL, 0x03)                            # chip is still making its STOP
+            queued = True
+        elif sent < 6 and not st & 0b1000:
+            await chip.write(HTX, q[sent])
+            sent += 1
+    while sent < 6:
+        await chip.write(HTX, q[sent])
+        sent += 1
+    got = []
+    for _ in range(400):                                            # both bytes, as they arrive
+        if len(got) == 2:
+            break
+        if not await chip.read(OUT_CSTAT) & 0b100:
+            got.append(await pop(chip))
+    await chip.clk(500)
+    assert got == [0x11, 0x22], f"read {[hex(x) for x in got]}"
+    assert gaps and min(gaps) >= 235, f"bus free time {gaps} clocks, Standard mode needs >= 235"
+
+
+@cocotb.test()
+async def test_i2c_bus_clear(dut):
+    """B35: a slave holds SDA low in the middle of a read byte (as after our
+    reset). The host's bus clear - the _busclear configuration, 9 SCL clocks
+    with SDA released - frees it, and the next transaction is exact."""
+    chip = await start(dut)
+    ee = I2cEeprom()
+    board = Board(dut, ee)
+    await load(chip, "i2c", "i2c_test_fast")
+    ee.mode, ee.cur, ee.j, ee.ps, ee.pd = "rd", 0x00, 2, 1, 0       # stuck inside a read byte
+    board.drive(3, 0)
+    await chip.clk(20)
+    assert (board.pad >> 3) & 1 == 0, "SDA is not held low"
+    await chip.write(GCTL, 0x00)
+    for a, d in config("i2c_test_fast_busclear"):
+        await chip.write(a, d)
+    await chip.write(S0 + 4, 0xFF)                                  # SHBUF: fire the 9 clocks
+    await chip.clk(400)
+    assert (board.pad >> 3) & 1 == 1, "SDA still low after the bus clear"
+    await chip.write(GCTL, 0x00)
+    for a, d in config("i2c_test_fast"):
+        await chip.write(a, d)
+    await chip.write(CCTL, 0x0D)
+    got = await i2c_write_read(chip, 0x40, [0xB4, 0x4B])
+    assert got == [0xB4, 0x4B], f"after the bus clear: read {[hex(x) for x in got]}"
+
+
+@cocotb.test()
+async def test_long_input_filter(dut):
+    """B36: with GCTL[2] a level needs 4 equal samples; a 3-clock pulse (what a
+    40-59 ns spike looks like) must not reach the chip. Seen on UART RX: the
+    long filter keeps the receiver's timer asleep; the normal filter (the
+    control) lets the same pulse start it."""
+    chip = await start(dut)
+    await load(chip, "uart", "uart_1m_8n1")
+    await chip.write(CCTL, 0x01)
+    for gctl, starts in ((0x05, False), (0x01, True)):
+        await chip.write(GCTL, gctl)
+        await chip.clk(100)
+        chip.rx = 0; chip._put(); await chip.clk(3)                 # a 3-sample pulse
+        chip.rx = 1; chip._put()
+        active = bool(await chip.read(OUT_TIMACTIVE) & 0b10)
+        assert active == starts, (f"GCTL {gctl:#04x}: a 3-clock pulse "
+                                  f"{'did not start' if starts else 'started'} the receiver")
+        await chip.clk(700)
+    assert await chip.read(OUT_CSTAT) & 0b100, "a pulse delivered a byte"
+
+
+# ---------------------------------------------------------------- E · the chip as a whole
+@cocotb.test()
+async def test_datapath_off_releases_pins(dut):
+    """B34: with the datapath off, a shifter set to drive pin 5 and a timer set
+    to drive pin 6 drive nothing; switched on, they do (the control); the
+    controller's own pin line (pin 7) keeps its pin either way."""
+    chip = await start(dut)
+    for a, d in [(S0 + 0, 0x83), (S0 + 1, 0x05), (T1 + 3, 0x1B), (0x0A, 0x37)]:
+        await chip.write(a, d)
+    oe = int(dut.uio_oe.value)
+    assert (oe >> 5) & 0b11 == 0, f"datapath off, but pins 5/6 are driven (uio_oe {oe:#04x})"
+    assert (oe >> 7) & 1, "the controller's pin line lost its pin"
+    await chip.write(GCTL, 0x01)
+    oe = int(dut.uio_oe.value)
+    assert (oe >> 5) & 0b11 == 0b11, f"datapath on, but pins 5/6 are not driven (uio_oe {oe:#04x})"
+    await chip.write(GCTL, 0x00)
+    assert (int(dut.uio_oe.value) >> 5) & 0b11 == 0, "datapath off again, pins 5/6 still driven"
+
+
+@cocotb.test()
+async def test_protocol_switch_without_reset(dut):
+    """B33: one chip, no reset: UART -> I2C -> SPI -> UART, each with its own
+    program and configuration. Nothing of the previous protocol may stay: after
+    I2C its SDA hold delay would slow SPI's SCK, after SPI its CS would stay
+    driven during UART."""
+    chip = await start(dut)
+    spi, ee = SpiEcho(0), I2cEeprom()
+    devs = Devices(spi=spi, i2c=ee)
+    board = Board(dut, devs)
+
+    async def uart_leg(tag):
+        devs.use(board, None)
+        await switch_to(chip, "uart", "uart_1m_8n1")
+        await chip.clk(200)
+        dec = cocotb.start_soon(decode_frame(chip, 50, 5000))
+        await chip.write(HTX, 0xC3)
+        b, _ = await dec
+        assert b == 0xC3, f"{tag}: UART TX decoded {b:#04x}"
+        await send_frames(chip, [0x3D], 50)
+        chip.rx = 1; chip._put(); await chip.clk(200)
+        assert await pop(chip) == 0x3D, f"{tag}: UART RX byte wrong"
+        assert int(dut.uio_oe.value) == 0, f"{tag}: a uio pin is driven during UART"
+
+    await uart_leg("UART first")
+    devs.use(board, "i2c")
+    await switch_to(chip, "i2c", "i2c_standard_100k")               # its SDA hold delay is on pin 3 ...
+    got = await i2c_write_read(chip, 0x50, [0x5E, 0xA1])
+    assert got == [0x5E, 0xA1], f"I2C after UART: read {[hex(x) for x in got]}"
+    devs.use(board, "spi")
+    await switch_to(chip, "spi", "spi_mode0_2m5")                   # ... which is SPI's SCK
+    sent = [0x12, 0xEE, 0x81]
+    got = await spi_txn(chip, sent)
+    assert spi.rx == sent and got == expected_echo(sent), f"SPI after I2C: slave {spi.rx}, host {got}"
+    await uart_leg("UART after SPI")                                # SPI's CS line must not stay driven
+
+
+@cocotb.test()
+async def test_reset_mid_transfer(dut):
+    """rst_n falls in the middle of an SPI transaction, between clock edges:
+    1 ns later every pin is safe (pads released, outputs high, SDO / READY
+    low). After program + configuration again, the next transaction is exact."""
+    chip = await start(dut)
+    slave = SpiEcho(0)
+    Board(dut, slave)
+    await load(chip, "spi", "spi_mode0_2m5")
+    await chip.write(0x68, 4)
+    for x in (0x01, 0x02, 0x03, 0x04):
+        await chip.write(HTX, x)
+    await chip.write(CCTL, 0x03)
+    await chip.clk(300)                                             # in the middle of byte 2
+    await RisingEdge(dut.clk)
+    await Timer(3, unit="ns")
+    dut.rst_n.value = 0
+    await Timer(1, unit="ns")
+    oe, uo = int(dut.uio_oe.value), int(dut.uo_out.value)
+    assert oe == 0, f"1 ns after reset: bidirectional pads still driven (uio_oe {oe:#04x})"
+    assert uo >> 4 == 0xF and uo & 0b11 == 0, f"1 ns after reset: uo_out {uo:#04x}"
+    await chip.clk(5)
+    dut.rst_n.value = 1
+    await chip.clk(10)
+    await load(chip, "spi", "spi_mode0_2m5")
+    sent = [0x6B, 0x94]
+    got = await spi_txn(chip, sent)
+    assert got == expected_echo(sent), f"after the reset the host read {[hex(x) for x in got]}"

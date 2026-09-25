@@ -13,23 +13,25 @@ Three layers:
   (16 rows); each row fires actions on entry (start a frame, set a pin, move
   a byte, load a counter or delay) and watches up to three exits plus a
   timeout. It runs chip-select, START/STOP, ACK/NACK checks, repeated START,
-  clock stretching and timeouts by itself.
+  clock stretching, timeouts and the I2C bus-free time between transactions
+  by itself.
 - **Datapath** - 2 timers + 2 shifters wired by configuration. A timer makes
   the bit clock, a shifter moves bits in or out on it (with start/stop bits,
   MSB/LSB first, open drain or push-pull). Each timer has a tick prescaler
   (`0x15+8n`), so slow rates like 9600 baud fit too. A controller timeout
   also stops the timers and shifters, releasing the bus.
 - **Pin layer** - 2-flop synchronisers and a 3-sample glitch filter on every
-  protocol input, registered outputs, safe reset levels, and an optional
-  output hold delay on one pad (I2C SDA hold time).
+  protocol input (4 samples for I2C Fast / Fast+, which must reject spikes
+  under 50 ns), registered outputs, safe reset levels, and an optional output
+  hold delay on one pad (I2C SDA hold time).
 
 The host talks to the chip through a 3-wire serial config port on
 `ui_in[2:0]`: 16-bit words `{address, data}`, MSB first, one SCK pulse per
 bit, committed when CS rises. Results are read back on `uo_out[0]` (SDO);
 `uo_out[1]` (READY) goes high when the controller finishes.
 
-Main registers: `0x00` GCTL (enable, filter off), `0x01` GOUT (what SDO
-returns), `0x02` CCTL (run / go / clear / flush), `0x03` push a byte to send,
+Main registers: `0x00` GCTL (enable - off releases the pins, filter off, long filter for I2C Fast / Fast+), `0x01` GOUT (what SDO
+returns), `0x02` CCTL (run / go / clear flags, framing errors included / flush), `0x03` push a byte to send,
 `0x04` pop a received byte, `0x05` CSEL, `0x06` PHOLD, `0x08-0x0B` controller
 pins, `0x10+8n` timer n, `0x30+8n` shifter n, `0x60-0x7F` the controller's
 table and settings.
@@ -51,6 +53,11 @@ SPI `uio[0]` CS, `uio[1]` MOSI, `uio[2]` MISO, `uio[3]` SCK; I2C `uio[2]` SCL,
 The cocotb tests in `test/` configure the chip only through its pins: reset
 levels, register read-back, UART transmit and receive. Run them with
 `cd test && make`.
+
+After a reset in the middle of an I2C transfer a slave may still hold SDA
+low. The host then runs a bus clear: 9 SCL clocks with SDA released (the
+same SCL timer started by a write to `0x34` with the controller not
+involved), then the normal I2C configuration again.
 
 ## External hardware
 

@@ -45,11 +45,18 @@ test/chip/
 test/legacy/
 test/harness/
 test/tools/
-# test/datapath_configs/: CI's test.py loads these three; the rest stay local
+# test/datapath_configs/: CI's test.py loads these; the rest stay local
 test/datapath_configs/*
 !test/datapath_configs/uart_1m_8n1.hex
 !test/datapath_configs/uart_9600_8n1.hex
 !test/datapath_configs/i2c_test_fast.hex
+!test/datapath_configs/i2c_test_fast_busclear.hex
+!test/datapath_configs/i2c_standard_100k.hex
+!test/datapath_configs/spi_mode0_2m5.hex
+!test/datapath_configs/spi_mode1_2m5.hex
+!test/datapath_configs/spi_mode2_2m5.hex
+!test/datapath_configs/spi_mode3_2m5.hex
+!test/datapath_configs/spi_mode0_2m5_lsb.hex
 test/config_lists/
 test/run.sh
 test/VERIFICATION.md

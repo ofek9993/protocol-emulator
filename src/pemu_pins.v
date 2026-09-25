@@ -9,9 +9,13 @@
  *        same raw wire in the same clock could see different values.
  *     2. a 3-sample glitch filter (AUDIT B20, part of B19): a new level is
  *        only accepted once it has been seen on 3 consecutive clocks, so a
- *        spike shorter than ~2 clocks (40 ns at 50 MHz) never gets in. The
- *        I2C spec requires devices to ignore spikes under 50 ns.
- *        filt_on = 0 bypasses it (lower latency, for fast buses).
+ *        spike shorter than 2 clocks (40 ns at 50 MHz) never gets in.
+ *        filt_long = 1 makes it 4 samples (AUDIT B36): spikes under 3 clocks
+ *        (60 ns) never get in - the I2C spec's tSP for Fast / Fast+ mode is
+ *        "spikes under 50 ns must be suppressed", which 3 samples do NOT
+ *        guarantee (a 49 ns spike can cover 3 samples). One more clock of
+ *        latency, so only the configurations that need it switch it on.
+ *        filt_on = 0 bypasses the filter (lower latency, for fast buses).
  *   OUTPUTS
  *     3. every pad output is a flop - no combinational glitches reach a pin
  *        (on an open-drain SCL a glitch would be a phantom clock);
@@ -40,6 +44,7 @@ module pemu_pins (
     input  wire        clk,
     input  wire        rst_n,
     input  wire        filt_on,
+    input  wire        filt_long,      // 4 samples instead of 3 (AUDIT B36)
 
     // raw pads
     input  wire [7:0]  uio_in,
@@ -60,18 +65,20 @@ module pemu_pins (
 
     // ---------------------------------------------------------- inputs
     wire [11:0] raw = {ui_proto, uio_in};
-    reg  [11:0] s1, s2, h1, h2, filt;
+    reg  [11:0] s1, s2, h1, h2, h3, filt;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            s1 <= 12'hFFF; s2 <= 12'hFFF; h1 <= 12'hFFF; h2 <= 12'hFFF; filt <= 12'hFFF;
+            s1 <= 12'hFFF; s2 <= 12'hFFF; h1 <= 12'hFFF; h2 <= 12'hFFF; h3 <= 12'hFFF; filt <= 12'hFFF;
         end else begin
             s1 <= raw;                     // synchroniser, stage 1
             s2 <= s1;                      // synchroniser, stage 2
-            h1 <= s2;                      // two samples of history
+            h1 <= s2;                      // samples of history
             h2 <= h1;
-            // per pin: accept a level only after 3 consecutive identical samples
-            filt <= (s2 & h1 & h2) | (filt & ~(~s2 & ~h1 & ~h2));
+            h3 <= h2;
+            // per pin: accept a level only after 3 (filt_long: 4) consecutive identical samples
+            if (filt_long) filt <= (s2 & h1 & h2 & h3) | (filt & ~(~s2 & ~h1 & ~h2 & ~h3));
+            else           filt <= (s2 & h1 & h2)      | (filt & ~(~s2 & ~h1 & ~h2));
         end
     end
 
